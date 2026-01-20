@@ -1,0 +1,6 @@
+streamlit
+pandas
+Pillow
+piexif
+openai
+iptcinfo3

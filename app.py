@@ -12,8 +12,8 @@ import traceback
 from iptcinfo3 import IPTCInfo
 
 # --- 1. Config ---
-st.set_page_config(page_title="AI Stock Vision - Perfect Title", layout="wide")
-st.title("🎯 AI Stock Vision (Descriptive Title Mode)")
+st.set_page_config(page_title="AI Stock Vision - Full Categories", layout="wide")
+st.title("🎯 AI Stock Vision (Descriptive Title + Full Categories)")
 
 # --- 2. Sidebar ---
 with st.sidebar:
@@ -25,22 +25,44 @@ with st.sidebar:
     api_key = st.text_input("🔑 API Key", type="password")
     model_choice = st.selectbox("🤖 Model", ["gpt-4o", "gpt-4o-mini"], index=0)
     
+    # --- อัปเดต: หมวดหมู่ Adobe Stock ครบ 21 หัวข้อ ---
     category_dict = {
-        "1-Animals": 1, "2-Architecture": 2, "3-Business": 3, "4-Drinks": 4, 
-        "5-Nature": 5, "6-Emotions": 6, "7-Food": 7, "8-Graphic": 8, 
-        "11-Landscape": 11, "13-People": 13, "19-Technology": 19, "21-Travel": 21
+        "1. Animals: สัตว์ แมลง สัตว์เลี้ยง": 1,
+        "2. Buildings and Architecture: บ้าน อาคาร งานออกแบบภายใน วัด โรงงาน": 2,
+        "3. Business: คนทำงาน สำนักงาน แนวคิดทางธุรกิจ การเงิน": 3,
+        "4. Drinks: เครื่องดื่ม วัฒนธรรมการดื่ม แอลกอฮอล์": 4,
+        "5. The Environment: ธรรมชาติ สถานที่ทำงานและที่อยู่อาศัย": 5,
+        "6. States of Mind: อารมณ์ ความรู้สึก ความคิดภายในจิตใจ": 6,
+        "7. Food: อาหาร การกิน วัตถุดิบ": 7,
+        "8. Graphic Resources: พื้นหลัง พื้นผิว สัญลักษณ์ต่างๆ": 8,
+        "9. Hobbies and Leisure: กิจกรรมยามว่าง การพักผ่อน งานอดิเรก": 9,
+        "10. Industry: งานอุตสาหกรรม การผลิต พลังงาน": 10,
+        "11. Landscape: ทิวทัศน์ เมือง วิวธรรมชาติ": 11,
+        "12. Lifestyle: กิจกรรมในชีวิตประจำวันของคนในสถานที่ต่างๆ": 12,
+        "13. People: ผู้คนทุกช่วงวัย เชื้อชาติ และความหลากหลาย": 13,
+        "14. Plants and Flowers: พืชพรรณ ดอกไม้ การจัดสวน": 14,
+        "15. Culture and Religion: ประเพณี ความเชื่อ วัฒนธรรมทั่วโลก": 15,
+        "16. Science: วิทยาศาสตร์ การแพทย์ การวิจัย": 16,
+        "17. Social Issues: ปัญหาสังคม การเมือง ความยากจน": 17,
+        "18. Sports: กีฬา การออกกำลังกาย สันทนาการ": 18,
+        "19. Technology: คอมพิวเตอร์ สมาร์ทโฟน AI และนวัตกรรม": 19,
+        "20. Transport: ยานพาหนะ ระบบขนส่ง รถ รถไฟ เครื่องบิน": 20,
+        "21. Travel: การท่องเที่ยว วัฒนธรรมท้องถิ่น สถานที่ท่องเที่ยว": 21
     }
-    selected_cat_name = st.selectbox("📁 Category", list(category_dict.keys()), index=4)
+    
+    # เลือกหมวดหมู่ (default เลือก Business ไว้ก่อน)
+    selected_cat_name = st.selectbox("📁 Adobe Category", list(category_dict.keys()), index=2)
+    
+    st.divider()
     user_hint = st.text_area("💡 Context Hint", placeholder="Ex: Chess piece with stock graph")
     blacklist = [x.strip().lower() for x in st.text_area("🛡️ Blacklist", "nike, apple, logo").split(",")]
 
-# --- 3. AI Function (แก้ Prompt ใหม่ตรงนี้) ---
+# --- 3. AI Function (Sentence Mode) ---
 def analyze_image_sentence(image_bytes, category, hint, key, model):
     try:
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
         client = openai.OpenAI(api_key=key)
         
-        # --- Prompt ใหม่: สั่งให้แต่งประโยค (Sentence) ไม่ใช่แค่ List คำ ---
         prompt = (
             f"Act as a professional Adobe Stock contributor. Analyze this image. Category: {category}. Context: {hint}\n\n"
             f"TASK 1: KEYWORDS\n"
@@ -125,7 +147,7 @@ try:
         st.session_state.results = {}
 
     if uploaded_images:
-        if st.button("🚀 เริ่มวิเคราะห์ (Title แบบประโยค)", use_container_width=True, type="primary"):
+        if st.button("🚀 เริ่มวิเคราะห์ (Full Categories)", use_container_width=True, type="primary"):
             if not api_key:
                 st.error("❌ ลืมใส่ API Key")
             else:
@@ -144,7 +166,6 @@ try:
             final_data = []
             
             for filename, data in st.session_state.results.items():
-                # กรองเฉพาะรูปที่ยังอยู่ในการอัปโหลด
                 if not any(u.name == filename for u in uploaded_images): continue
 
                 with st.container(border=True):
@@ -164,7 +185,7 @@ try:
                         "Filename": filename.split('.')[0] + ".jpg",
                         "Title": et,
                         "Keywords": final_k_str,
-                        "Category": category_dict[selected_cat_name],
+                        "Category": category_dict[selected_cat_name], # ส่งค่า ID 1-21 ไปให้ CSV
                         "Releases": "",
                         "original_bytes": data['bytes']
                     })

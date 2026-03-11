@@ -12,7 +12,7 @@ import traceback
 from iptcinfo3 import IPTCInfo
 
 # --- 1. Config ---
-st.set_page_config(page_title="AI Stock Vision - Expert Mode", layout="wide")
+st.set_page_config(page_title="AI Stock Vision - Pro & Expert", layout="wide")
 st.title("🎯 AI Stock Vision (Pro & Expert Mode)")
 
 # --- 2. Sidebar ---
@@ -24,15 +24,19 @@ with st.sidebar:
         
     api_key = st.text_input("🔑 API Key", type="password")
     
-    # --- อัปเดตเมนู Model ตามที่กำหนด ---
+    # --- อัปเดตเมนู Model ให้ยืดหยุ่นขึ้น ---
     model_options = {
-        "GPT-5.4 → ผู้เชี่ยวชาญ": "gpt-5.4", 
-        "GPT-5 → คนทำงาน": "gpt-5",
-        "GPT-4o (ตัวท็อปมาตรฐาน)": "gpt-4o",
-        "GPT-4o-mini (ประหยัดงบ)": "gpt-4o-mini"
+        "GPT-4o (ผู้เชี่ยวชาญ/ตัวท็อป)": "gpt-4o",
+        "GPT-4o-mini (คนทำงาน/ประหยัด)": "gpt-4o-mini",
+        "กรอกชื่อโมเดลเอง (Custom)": "custom"
     }
     selected_model_display = st.selectbox("🤖 Model", list(model_options.keys()), index=0)
-    model_choice = model_options[selected_model_display]
+    
+    # ดักจับกรณีผู้ใช้ต้องการกรอกชื่อโมเดล GPT-5 ใหม่ๆ ด้วยตัวเอง
+    if selected_model_display == "กรอกชื่อโมเดลเอง (Custom)":
+        model_choice = st.text_input("✏️ พิมพ์รหัส API โมเดล (เช่น gpt-5, gpt-5-turbo)", value="gpt-5")
+    else:
+        model_choice = model_options[selected_model_display]
     
     category_dict = {
         "1. Animals: สัตว์ แมลง สัตว์เลี้ยง": 1,
@@ -109,6 +113,8 @@ def analyze_image_sentence(image_bytes, category, hint, key, model):
             
         return t, k, raw_text, False
 
+    except openai.NotFoundError:
+        return f"Error: Model '{model}' ไม่ถูกต้องหรือยังไม่เปิดให้ใช้งาน", "กรุณาตรวจสอบชื่อโมเดล", f"API Error", True
     except Exception as e:
         return "Error", str(e), str(e), True
 
@@ -178,6 +184,9 @@ try:
                 with st.container(border=True):
                     c1, c2 = st.columns([1, 2])
                     c1.image(data['bytes'], width=150)
+                    
+                    if data['err'] and "Model" in data['t']:
+                        st.error(f"⚠️ {data['t']}")
                     
                     et = c2.text_input("Title", value=data['t'], key=f"t_{filename}")
                     ek = c2.text_area("Keywords", value=data['k'], key=f"k_{filename}")

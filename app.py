@@ -12,8 +12,8 @@ import traceback
 from iptcinfo3 import IPTCInfo
 
 # --- 1. Config ---
-st.set_page_config(page_title="AI Stock Vision - Full Categories", layout="wide")
-st.title("🎯 AI Stock Vision (Descriptive Title + Full Categories)")
+st.set_page_config(page_title="AI Stock Vision - Expert Mode", layout="wide")
+st.title("🎯 AI Stock Vision (GPT-5.4 Expert Mode)")
 
 # --- 2. Sidebar ---
 with st.sidebar:
@@ -23,9 +23,16 @@ with st.sidebar:
         st.rerun()
         
     api_key = st.text_input("🔑 API Key", type="password")
-    model_choice = st.selectbox("🤖 Model", ["gpt-4o", "gpt-4o-mini"], index=0)
     
-    # --- อัปเดต: หมวดหมู่ Adobe Stock ครบ 21 หัวข้อ ---
+    # --- อัปเดตเมนู Model ใหม่ ---
+    model_options = {
+        "GPT-5.4 (ผู้เชี่ยวชาญ)": "gpt-5.4", # เปลี่ยนรหัส API ตรงนี้ได้ถ้า OpenAI ใช้ชื่ออื่น
+        "GPT-4o (ตัวท็อปมาตรฐาน)": "gpt-4o",
+        "GPT-4o-mini (ประหยัดงบ)": "gpt-4o-mini"
+    }
+    selected_model_display = st.selectbox("🤖 Model", list(model_options.keys()), index=0)
+    model_choice = model_options[selected_model_display]
+    
     category_dict = {
         "1. Animals: สัตว์ แมลง สัตว์เลี้ยง": 1,
         "2. Buildings and Architecture: บ้าน อาคาร งานออกแบบภายใน วัด โรงงาน": 2,
@@ -50,14 +57,13 @@ with st.sidebar:
         "21. Travel: การท่องเที่ยว วัฒนธรรมท้องถิ่น สถานที่ท่องเที่ยว": 21
     }
     
-    # เลือกหมวดหมู่ (default เลือก Business ไว้ก่อน)
     selected_cat_name = st.selectbox("📁 Adobe Category", list(category_dict.keys()), index=2)
     
     st.divider()
     user_hint = st.text_area("💡 Context Hint", placeholder="Ex: Chess piece with stock graph")
     blacklist = [x.strip().lower() for x in st.text_area("🛡️ Blacklist", "nike, apple, logo").split(",")]
 
-# --- 3. AI Function (Sentence Mode) ---
+# --- 3. AI Function ---
 def analyze_image_sentence(image_bytes, category, hint, key, model):
     try:
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
@@ -147,7 +153,7 @@ try:
         st.session_state.results = {}
 
     if uploaded_images:
-        if st.button("🚀 เริ่มวิเคราะห์ (Full Categories)", use_container_width=True, type="primary"):
+        if st.button("🚀 เริ่มวิเคราะห์ (Expert Model)", use_container_width=True, type="primary"):
             if not api_key:
                 st.error("❌ ลืมใส่ API Key")
             else:
@@ -185,7 +191,7 @@ try:
                         "Filename": filename.split('.')[0] + ".jpg",
                         "Title": et,
                         "Keywords": final_k_str,
-                        "Category": category_dict[selected_cat_name], # ส่งค่า ID 1-21 ไปให้ CSV
+                        "Category": category_dict[selected_cat_name],
                         "Releases": "",
                         "original_bytes": data['bytes']
                     })
@@ -202,7 +208,7 @@ try:
                             for item in final_data:
                                 final_jpg = process_to_jpg_iptc(item['original_bytes'], item['Title'], item['Keywords'])
                                 zf.writestr(item['Filename'], final_jpg)
-                        st.download_button("📂 คลิกเพื่อโหลด ZIP", z_buf.getvalue(), "images_final.zip", use_container_width=True)
+                        st.download_button("📂 คลิกเพื่อโหลด ZIP", z_buf.getvalue(), "images_expert.zip", use_container_width=True)
 
 except Exception as e:
     st.error("Application Error")

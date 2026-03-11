@@ -13,7 +13,7 @@ from iptcinfo3 import IPTCInfo
 
 # --- 1. Config ---
 st.set_page_config(page_title="AI Stock Vision - Expert Mode", layout="wide")
-st.title("🎯 AI Stock Vision (GPT-5.4 Expert Mode)")
+st.title("🎯 AI Stock Vision (Pro & Expert Mode)")
 
 # --- 2. Sidebar ---
 with st.sidebar:
@@ -24,9 +24,10 @@ with st.sidebar:
         
     api_key = st.text_input("🔑 API Key", type="password")
     
-    # --- อัปเดตเมนู Model ใหม่ ---
+    # --- อัปเดตเมนู Model ตามที่กำหนด ---
     model_options = {
-        "GPT-5.4 (ผู้เชี่ยวชาญ)": "gpt-5.4", # เปลี่ยนรหัส API ตรงนี้ได้ถ้า OpenAI ใช้ชื่ออื่น
+        "GPT-5.4 → ผู้เชี่ยวชาญ": "gpt-5.4", 
+        "GPT-5 → คนทำงาน": "gpt-5",
         "GPT-4o (ตัวท็อปมาตรฐาน)": "gpt-4o",
         "GPT-4o-mini (ประหยัดงบ)": "gpt-4o-mini"
     }
@@ -153,7 +154,7 @@ try:
         st.session_state.results = {}
 
     if uploaded_images:
-        if st.button("🚀 เริ่มวิเคราะห์ (Expert Model)", use_container_width=True, type="primary"):
+        if st.button("🚀 เริ่มวิเคราะห์", use_container_width=True, type="primary"):
             if not api_key:
                 st.error("❌ ลืมใส่ API Key")
             else:
@@ -208,7 +209,7 @@ try:
                             for item in final_data:
                                 final_jpg = process_to_jpg_iptc(item['original_bytes'], item['Title'], item['Keywords'])
                                 zf.writestr(item['Filename'], final_jpg)
-                        st.download_button("📂 คลิกเพื่อโหลด ZIP", z_buf.getvalue(), "images_expert.zip", use_container_width=True)
+                        st.download_button("📂 คลิกเพื่อโหลด ZIP", z_buf.getvalue(), "images_final.zip", use_container_width=True)
 
 except Exception as e:
     st.error("Application Error")

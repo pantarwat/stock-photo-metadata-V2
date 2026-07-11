@@ -18,6 +18,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from PIL.PngImagePlugin import PngInfo
 from iptcinfo3 import IPTCInfo
 from openai import OpenAI
+from pydantic import BaseModel, Field, ValidationError
 
 
 # =========================================================
@@ -856,10 +857,39 @@ def deterministic_quality_check(
 
 
 # =========================================================
-# 8) OPENAI HELPERS
+# 8) STRUCTURED OUTPUT SCHEMAS
 # =========================================================
-def extract_json(raw_text: str) -> Dict[str, Any]:
+class StockMetadataSchema(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    keywords: List[str] = Field(min_length=49, max_length=49)
+    quality_notes: List[str] = Field(default_factory=list, max_length=3)
+    risk_notes: List[str] = Field(default_factory=list, max_length=5)
+
+
+class TitleOnlySchema(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+class QualityReviewSchema(BaseModel):
+    relevance_score: int = Field(ge=0, le=10)
+    naturalness_score: int = Field(ge=0, le=10)
+    keyword_accuracy_score: int = Field(ge=0, le=10)
+    notes: List[str] = Field(default_factory=list, max_length=5)
+
+
+# =========================================================
+# 9) OPENAI STRUCTURED OUTPUT HELPERS
+# =========================================================
+def extract_json_fallback(raw_text: str) -> Dict[str, Any]:
+    """
+    Fallback only. Primary path uses client.responses.parse().
+    Handles plain JSON, Markdown fences, and JSON embedded in prose.
+    """
     text = (raw_text or "").strip()
+
+    if not text:
+        raise ValueError("โมเดลส่งผลลัพธ์ว่าง")
+
     text = re.sub(
         r"^```(?:json)?\s*",
         "",
@@ -875,42 +905,104 @@ def extract_json(raw_text: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[index:])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
 
-    if not match:
-        raise ValueError("ไม่พบ JSON ในผลลัพธ์ของโมเดล")
-
-    parsed = json.loads(match.group(0))
-
-    if not isinstance(parsed, dict):
-        raise ValueError("JSON output ไม่ใช่ object")
-
-    return parsed
+    raise ValueError(
+        "ไม่พบ JSON ที่ใช้งานได้ในผลลัพธ์ของโมเดล"
+    )
 
 
-def call_openai(
+def safe_response_text(response: Any) -> str:
+    return redact_secrets(
+        (getattr(response, "output_text", "") or "").strip()
+    )
+
+
+def parsed_response_or_raise(
+    response: Any,
+    schema_class: Any,
+) -> Any:
+    """Return output_parsed or validate a fallback JSON payload."""
+    parsed = getattr(response, "output_parsed", None)
+
+    if parsed is not None:
+        return parsed
+
+    raw_text = safe_response_text(response)
+
+    try:
+        fallback_data = extract_json_fallback(raw_text)
+        return schema_class.model_validate(fallback_data)
+    except Exception as error:
+        preview = raw_text[:2000] if raw_text else "<empty output>"
+        raise ValueError(
+            "Structured Output ไม่ถูกสร้างตาม Schema\n\n"
+            f"รายละเอียด: {error}\n\n"
+            f"Raw model output:\n{preview}"
+        ) from error
+
+
+def call_structured_openai(
     client: OpenAI,
     model: str,
     input_payload: List[Dict[str, Any]],
+    schema_class: Any,
     max_output_tokens: int,
     retries: int = 3,
-) -> Any:
+) -> Tuple[Any, str]:
+    """
+    Primary: Responses API Structured Outputs via responses.parse().
+    Fallback: normal Responses API + strict JSON prompt parsing.
+    """
     last_error: Optional[Exception] = None
 
     for attempt in range(retries):
         try:
-            return client.responses.create(
+            parse_method = getattr(client.responses, "parse", None)
+
+            if callable(parse_method):
+                response = parse_method(
+                    model=model,
+                    input=input_payload,
+                    text_format=schema_class,
+                    max_output_tokens=max_output_tokens,
+                )
+                parsed = parsed_response_or_raise(
+                    response,
+                    schema_class,
+                )
+                return parsed, safe_response_text(response)
+
+            # Compatibility fallback for older SDKs.
+            response = client.responses.create(
                 model=model,
                 input=input_payload,
                 max_output_tokens=max_output_tokens,
             )
+            parsed = parsed_response_or_raise(
+                response,
+                schema_class,
+            )
+            return parsed, safe_response_text(response)
+
         except Exception as error:
             last_error = error
 
             if attempt < retries - 1:
                 time.sleep(1.5 * (2**attempt))
 
-    raise last_error or RuntimeError("OpenAI request failed")
+    raise last_error or RuntimeError(
+        "OpenAI Structured Output request failed"
+    )
 
 
 def image_data_url(data: bytes) -> str:
@@ -920,7 +1012,7 @@ def image_data_url(data: bytes) -> str:
 
 
 # =========================================================
-# 9) PROMPTS
+# 10) PROMPTS
 # =========================================================
 def metadata_prompt(
     category_name: str,
@@ -931,7 +1023,7 @@ def metadata_prompt(
     return f"""
 You are a senior Adobe Stock metadata editor.
 
-Analyze the image accurately and create high-quality searchable metadata.
+Analyze the uploaded image accurately and create searchable metadata.
 
 SELECTED CATEGORY
 - {category_name}
@@ -945,53 +1037,37 @@ FORBIDDEN TERMS
 
 MANDATORY WORKFLOW
 
-STEP 1 — KEYWORDS
-Generate exactly 49 unique English keywords ordered from most important
-to least important.
+1. Create exactly 49 unique English keywords in descending importance.
+2. The first 10 keywords must be the strongest buyer search terms.
+3. Keep each of the first 10 concise enough to fit naturally in one title.
+4. The first 10 must cover different useful aspects rather than repeat synonyms.
+5. After finalizing all keywords, write one English title.
+6. Every one of the first 10 keywords must appear verbatim in the title,
+   ignoring capitalization and punctuation.
+7. The title must still be grammatical, natural, clear, and human-written.
 
-The first 10 keywords have a special requirement:
-- They must be the strongest search terms for the visible image.
-- Keep them concise enough to fit naturally inside one title.
-- Prefer single words or short phrases.
-- Do not make the first 10 synonyms of the same concept.
-- Together they should cover the subject, action, setting,
-  visual attributes, and commercial concept.
-- Every one of these first 10 keywords must later appear verbatim
-  in the title, ignoring capitalization and punctuation.
-
-STEP 2 — TITLE
-After the 49 keywords are finalized, write one English stock title.
-
-The title must:
-- Contain every first-10 keyword verbatim.
-- Remain natural, grammatical, clear, and easy to understand.
-- Never look like a raw keyword list.
+TITLE RULES
+- Maximum 200 characters.
+- Prefer 100–200 characters when natural.
 - Put the main subject and action early.
-- Prefer 100–200 characters.
-- Never exceed 200 characters.
-- Avoid excessive commas.
-- Not begin with “Image of”, “Photo of”, or “Picture of”.
-- Not add details unsupported by the visible image.
-- Not contain brands, trademarks, logos, celebrities,
+- Do not output a raw keyword list.
+- Avoid excessive commas and unnatural repetition.
+- Do not begin with “Image of”, “Photo of”, or “Picture of”.
+- Do not invent unsupported details.
+- Do not use brands, trademarks, logos, celebrity names,
   copyrighted characters, or forbidden terms.
 
-Before returning:
-- Count all keywords and confirm there are exactly 49.
-- Confirm the first 10 all appear verbatim in the title.
-- Rewrite internally until both conditions are true.
+KEYWORD RULES
+- Exactly 49 unique English keywords.
+- Most important first.
+- Relevant to visible content and useful buyer intent.
+- No irrelevant filler or unnecessary singular/plural duplication.
+- No brands, trademarks, copyrighted names, or celebrity names.
 
-Return valid JSON only:
-
-{{
-  "title": "natural stock title containing all first 10 keywords",
-  "keywords": [
-    "keyword 1",
-    "keyword 2",
-    "keyword 3"
-  ],
-  "quality_notes": [],
-  "risk_notes": []
-}}
+Before finalizing, verify internally that:
+- keyword count is exactly 49
+- first-10 title coverage is 10/10
+- title length is at most 200 characters
 """.strip()
 
 
@@ -1006,10 +1082,10 @@ def title_repair_prompt(
     return f"""
 You are a senior Adobe Stock title editor.
 
-TOP 10 KEYWORDS — all must appear verbatim in the new title:
+TOP 10 KEYWORDS — each phrase must appear verbatim in the new title:
 {", ".join(top_ten)}
 
-KEYWORDS CURRENTLY MISSING FROM THE TITLE:
+CURRENTLY MISSING:
 {", ".join(missing_keywords) if missing_keywords else "None"}
 
 CURRENT TITLE:
@@ -1020,19 +1096,14 @@ OPTIONAL CONTEXT:
 
 Write one improved English stock title.
 
-Mandatory rules:
-- Include all 10 supplied keywords verbatim, ignoring capitalization.
-- Keep the title natural, grammatical, readable, and human-written.
-- Do not output a keyword list.
-- Put the main subject and action early.
+Mandatory requirements:
+- Include all 10 supplied keywords verbatim.
+- Maximum 200 characters.
+- Natural, grammatical, readable, and human-written.
+- Not a raw keyword list.
+- Main subject and action should appear early.
 - Do not invent unsupported details.
-- Prefer 100–200 characters.
-- Never exceed 200 characters.
-- Avoid excessive commas.
-- Return a title meaningfully improved from the current title.
-
-Return valid JSON only:
-{{"title": "new title"}}
+- Avoid excessive commas and awkward repetition.
 """.strip()
 
 
@@ -1043,7 +1114,7 @@ def quality_review_prompt(
     return f"""
 You are a strict Adobe Stock metadata quality reviewer.
 
-Review the supplied title and keywords against the uploaded image.
+Review this metadata against the uploaded image.
 
 TITLE
 {title}
@@ -1051,33 +1122,54 @@ TITLE
 KEYWORDS
 {keywords}
 
-Evaluate:
-1. relevance_score: How accurately the title describes the visible image.
-2. naturalness_score: How natural, clear, and grammatical the title is.
-3. keyword_accuracy_score: How relevant and non-misleading the keywords are.
+Score each criterion from 0 to 10 using integers:
+- relevance_score: title accuracy against visible image content
+- naturalness_score: title clarity, grammar, and natural readability
+- keyword_accuracy_score: keyword relevance and lack of misleading concepts
 
-Scoring:
-- Integer from 0 to 10.
-- 10 means excellent.
-- Be strict. Unsupported concepts must reduce the score.
-
-Also return up to 5 short actionable notes.
-
-Do not rewrite the metadata.
-Return valid JSON only:
-
-{{
-  "relevance_score": 0,
-  "naturalness_score": 0,
-  "keyword_accuracy_score": 0,
-  "notes": []
-}}
+Be strict. Unsupported concepts must lower the score.
+Return no more than 5 short actionable notes.
 """.strip()
 
 
 # =========================================================
-# 10) AI OPERATIONS
+# 11) AI OPERATIONS
 # =========================================================
+def repair_title_once(
+    client: OpenAI,
+    model: str,
+    keywords: str,
+    current_title: str,
+    hint: str,
+) -> Tuple[str, str]:
+    coverage = top_keyword_coverage(
+        current_title,
+        keywords,
+    )
+
+    parsed, raw = call_structured_openai(
+        client=client,
+        model=model,
+        input_payload=[{
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": title_repair_prompt(
+                    keywords=keywords,
+                    current_title=current_title,
+                    missing_keywords=coverage["missing"],
+                    hint=hint,
+                ),
+            }],
+        }],
+        schema_class=TitleOnlySchema,
+        max_output_tokens=450,
+        retries=2,
+    )
+
+    return normalize_title(parsed.title), raw
+
+
 def generate_metadata(
     image_bytes: bytes,
     api_key: str,
@@ -1090,7 +1182,7 @@ def generate_metadata(
     try:
         client = OpenAI(api_key=api_key)
 
-        response = call_openai(
+        parsed, raw = call_structured_openai(
             client=client,
             model=model,
             input_payload=[{
@@ -1112,25 +1204,25 @@ def generate_metadata(
                     },
                 ],
             }],
+            schema_class=StockMetadataSchema,
             max_output_tokens=1800,
+            retries=3,
         )
 
-        raw = (response.output_text or "").strip()
-        parsed = extract_json(raw)
-
-        title = normalize_title(parsed.get("title", ""))
+        title = normalize_title(parsed.title)
         keywords = normalize_keywords(
-            parsed.get("keywords", []),
+            parsed.keywords,
             blacklist,
+            limit=KEYWORD_LIMIT,
         )
 
-        if not title:
-            raise ValueError("โมเดลไม่ได้สร้าง Title")
+        if keyword_count(keywords) != KEYWORD_LIMIT:
+            raise ValueError(
+                "Structured Output ผ่าน Schema แต่ Keywords หลังการกรอง "
+                f"เหลือ {keyword_count(keywords)}/{KEYWORD_LIMIT} คำ "
+                "อาจเกิดจากคำซ้ำหรือคำ Blacklist"
+            )
 
-        if not keywords:
-            raise ValueError("โมเดลไม่ได้สร้าง Keywords")
-
-        # ตรวจและแก้ Title อัตโนมัติ เพื่อให้ Top 10 ครบ 10/10
         repair_history: List[Dict[str, Any]] = []
 
         for attempt in range(1, MAX_TITLE_REPAIR_ATTEMPTS + 1):
@@ -1139,55 +1231,44 @@ def generate_metadata(
             if coverage["complete"] and len(title) <= TITLE_MAX_LENGTH:
                 break
 
-            repair_response = call_openai(
+            previous_title = title
+            title, repair_raw = repair_title_once(
                 client=client,
                 model=model,
-                input_payload=[{
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": title_repair_prompt(
-                            keywords=keywords,
-                            current_title=title,
-                            missing_keywords=coverage["missing"],
-                            hint=hint,
-                        ),
-                    }],
-                }],
-                max_output_tokens=450,
+                keywords=keywords,
+                current_title=title,
+                hint=hint,
             )
-
-            repaired_raw = (
-                repair_response.output_text or ""
-            ).strip()
-
-            new_title = normalize_title(
-                extract_json(repaired_raw).get("title", "")
-            )
-
-            if new_title:
-                title = new_title
 
             repair_history.append({
                 "attempt": attempt,
                 "missing_before": coverage["missing"],
-                "title_after": title,
+                "previous_title": previous_title,
+                "new_title": title,
+                "raw": repair_raw,
             })
+
+        final_coverage = top_keyword_coverage(
+            title,
+            keywords,
+        )
 
         return {
             "title": title,
             "keywords": keywords,
-            "quality_notes": (
-                parsed.get("quality_notes", [])[:3]
-                if isinstance(parsed.get("quality_notes", []), list)
-                else []
-            ),
-            "risk_notes": (
-                parsed.get("risk_notes", [])[:5]
-                if isinstance(parsed.get("risk_notes", []), list)
-                else []
-            ),
+            "quality_notes": [
+                normalize_spaces(note)
+                for note in parsed.quality_notes[:3]
+                if normalize_spaces(note)
+            ],
+            "risk_notes": [
+                normalize_spaces(note)
+                for note in parsed.risk_notes[:5]
+                if normalize_spaces(note)
+            ],
             "repair_history": repair_history,
+            "structured_output": True,
+            "top_10_complete": final_coverage["complete"],
             "raw": raw,
             "error": False,
             "error_message": "",
@@ -1202,7 +1283,9 @@ def generate_metadata(
             "quality_notes": [],
             "risk_notes": [],
             "repair_history": [],
-            "raw": message,
+            "structured_output": False,
+            "top_10_complete": False,
+            "raw": redact_secrets(str(error)),
             "error": True,
             "error_message": message,
         }
@@ -1219,6 +1302,10 @@ def regenerate_title_until_valid(
         return {
             "title": current_title,
             "attempts": 0,
+            "coverage": top_keyword_coverage(
+                current_title,
+                keywords,
+            ),
             "error": True,
             "error_message": "ต้องมีอย่างน้อย 10 Keywords ก่อน",
         }
@@ -1227,60 +1314,37 @@ def regenerate_title_until_valid(
         client = OpenAI(api_key=api_key)
         title = normalize_title(current_title)
         attempts = 0
+        raw_outputs: List[str] = []
 
         for attempt in range(1, MAX_TITLE_REPAIR_ATTEMPTS + 1):
-            coverage = top_keyword_coverage(title, keywords)
-
-            if (
-                coverage["complete"]
-                and 0 < len(title) <= TITLE_MAX_LENGTH
-                and attempt > 1
-            ):
-                break
-
-            response = call_openai(
+            title, raw = repair_title_once(
                 client=client,
                 model=model,
-                input_payload=[{
-                    "role": "user",
-                    "content": [{
-                        "type": "input_text",
-                        "text": title_repair_prompt(
-                            keywords=keywords,
-                            current_title=title,
-                            missing_keywords=coverage["missing"],
-                            hint=hint,
-                        ),
-                    }],
-                }],
-                max_output_tokens=450,
+                keywords=keywords,
+                current_title=title,
+                hint=hint,
             )
-
-            generated_title = normalize_title(
-                extract_json(
-                    response.output_text or ""
-                ).get("title", "")
-            )
-
-            if generated_title:
-                title = generated_title
-
+            raw_outputs.append(raw)
             attempts = attempt
 
-            final_coverage = top_keyword_coverage(
+            coverage = top_keyword_coverage(
                 title,
                 keywords,
             )
 
-            if (
-                final_coverage["complete"]
-                and len(title) <= TITLE_MAX_LENGTH
-            ):
+            if coverage["complete"] and len(title) <= TITLE_MAX_LENGTH:
                 break
+
+        final_coverage = top_keyword_coverage(
+            title,
+            keywords,
+        )
 
         return {
             "title": title,
             "attempts": attempts,
+            "coverage": final_coverage,
+            "raw_outputs": raw_outputs,
             "error": False,
             "error_message": "",
         }
@@ -1289,6 +1353,11 @@ def regenerate_title_until_valid(
         return {
             "title": current_title,
             "attempts": 0,
+            "coverage": top_keyword_coverage(
+                current_title,
+                keywords,
+            ),
+            "raw_outputs": [],
             "error": True,
             "error_message": friendly_api_error(error, model),
         }
@@ -1304,7 +1373,7 @@ def ai_quality_review(
     try:
         client = OpenAI(api_key=api_key)
 
-        response = call_openai(
+        parsed, raw = call_structured_openai(
             client=client,
             model=model,
             input_payload=[{
@@ -1324,37 +1393,21 @@ def ai_quality_review(
                     },
                 ],
             }],
+            schema_class=QualityReviewSchema,
             max_output_tokens=500,
+            retries=3,
         )
-
-        parsed = extract_json(
-            response.output_text or ""
-        )
-
-        def bounded_score(key: str) -> int:
-            try:
-                return max(
-                    0,
-                    min(10, int(parsed.get(key, 0))),
-                )
-            except Exception:
-                return 0
 
         return {
-            "relevance_score": bounded_score(
-                "relevance_score"
-            ),
-            "naturalness_score": bounded_score(
-                "naturalness_score"
-            ),
-            "keyword_accuracy_score": bounded_score(
-                "keyword_accuracy_score"
-            ),
-            "notes": (
-                parsed.get("notes", [])[:5]
-                if isinstance(parsed.get("notes", []), list)
-                else []
-            ),
+            "relevance_score": parsed.relevance_score,
+            "naturalness_score": parsed.naturalness_score,
+            "keyword_accuracy_score": parsed.keyword_accuracy_score,
+            "notes": [
+                normalize_spaces(note)
+                for note in parsed.notes[:5]
+                if normalize_spaces(note)
+            ],
+            "raw": raw,
             "error": False,
             "error_message": "",
         }
@@ -1365,6 +1418,7 @@ def ai_quality_review(
             "naturalness_score": 0,
             "keyword_accuracy_score": 0,
             "notes": [],
+            "raw": redact_secrets(str(error)),
             "error": True,
             "error_message": friendly_api_error(error, model),
         }

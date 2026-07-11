@@ -31,8 +31,8 @@ st.set_page_config(
 
 st.title("🎯 AI Stock Vision Pro")
 st.caption(
-    "สร้าง Title จาก 10 Keywords แรก พร้อม Export CSV / ZIP "
-    "และรักษาไฟล์ JPG, JPEG, PNG ตามต้นฉบับ"
+    "สร้างและตรวจคุณภาพ Adobe Stock Metadata • "
+    "49 Keywords • 10 Keywords แรกต้องอยู่ใน Title ครบ 10/10"
 )
 
 
@@ -65,17 +65,19 @@ CATEGORY_DICT = {
 
 DEFAULT_BLACKLIST = (
     "nike, apple, adidas, disney, marvel, coca-cola, samsung, sony, "
-    "tesla, iphone, ipad, macbook, logo, trademark, brand, celebrity"
+    "tesla, iphone, ipad, macbook, logo, trademark, celebrity"
 )
 
 KEYWORD_LIMIT = 49
 TOP_KEYWORD_COUNT = 10
+TITLE_MIN_LENGTH = 70
 TITLE_MAX_LENGTH = 200
+MAX_TITLE_REPAIR_ATTEMPTS = 3
 ANALYSIS_MAX_SIDE = 1800
 ANALYSIS_JPEG_QUALITY = 90
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
-# ลบได้เฉพาะโฟลเดอร์ที่แอปสร้างเองเท่านั้น
+# แอปลบได้เฉพาะโฟลเดอร์นี้เท่านั้น
 APP_CACHE_DIR = Path(
     os.getenv(
         "AI_STOCK_CACHE_DIR",
@@ -85,8 +87,8 @@ APP_CACHE_DIR = Path(
 UPLOAD_CACHE_DIR = APP_CACHE_DIR / "uploads"
 EXPORT_CACHE_DIR = APP_CACHE_DIR / "exports"
 
-for folder in (UPLOAD_CACHE_DIR, EXPORT_CACHE_DIR):
-    folder.mkdir(parents=True, exist_ok=True)
+for directory in (UPLOAD_CACHE_DIR, EXPORT_CACHE_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
 
 # =========================================================
@@ -96,6 +98,7 @@ DEFAULT_STATE = {
     "results": {},
     "analysis_cache": {},
     "title_cache": {},
+    "quality_cache": {},
     "uploader_version": 0,
     "generated_zip": None,
     "generated_zip_name": "",
@@ -103,23 +106,22 @@ DEFAULT_STATE = {
     "model_refresh_version": 0,
 }
 
-for key, default_value in DEFAULT_STATE.items():
-    if key not in st.session_state:
-        st.session_state[key] = default_value
+for state_key, default_value in DEFAULT_STATE.items():
+    if state_key not in st.session_state:
+        st.session_state[state_key] = default_value
 
 
 # =========================================================
-# 4) SECURITY AND GENERAL HELPERS
+# 4) SECURITY / GENERAL HELPERS
 # =========================================================
-def redact_secrets(text: Any) -> str:
-    cleaned = str(text or "")
-    patterns = [
+def redact_secrets(value: Any) -> str:
+    text = str(value or "")
+    for pattern in (
         r"sk-proj-[A-Za-z0-9_-]+",
         r"sk-[A-Za-z0-9_-]+",
-    ]
-    for pattern in patterns:
-        cleaned = re.sub(pattern, "[REDACTED_OPENAI_API_KEY]", cleaned)
-    return cleaned
+    ):
+        text = re.sub(pattern, "[REDACTED_OPENAI_API_KEY]", text)
+    return text
 
 
 def normalize_spaces(value: Any) -> str:
@@ -142,22 +144,31 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def stable_hash(payload: Dict[str, Any]) -> str:
+    serialized = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def original_extension(filename: str) -> str:
-    ext = Path(filename).suffix.lower()
-    return ".jpg" if ext == ".jpe" else ext
+    extension = Path(filename).suffix.lower()
+    return ".jpg" if extension == ".jpe" else extension
 
 
 def sanitize_filename(filename: str) -> str:
-    base = os.path.basename(filename)
-    path = Path(base)
-    ext = path.suffix.lower()
+    path = Path(os.path.basename(filename))
+    extension = path.suffix.lower()
 
-    if ext not in SUPPORTED_EXTENSIONS:
-        ext = ".jpg"
+    if extension not in SUPPORTED_EXTENSIONS:
+        extension = ".jpg"
 
     stem = re.sub(r"[^\w\-. ]+", "_", path.stem, flags=re.UNICODE)
     stem = re.sub(r"\s+", " ", stem).strip(" ._-") or "image"
-    return f"{stem}{ext}"
+    return f"{stem}{extension}"
 
 
 def unique_file_id(filename: str, data: bytes) -> str:
@@ -166,10 +177,9 @@ def unique_file_id(filename: str, data: bytes) -> str:
 
 def human_size(size_bytes: int) -> str:
     size = float(size_bytes)
-    units = ["B", "KB", "MB", "GB", "TB"]
 
-    for unit in units:
-        if size < 1024 or unit == units[-1]:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
             return f"{size:.2f} {unit}"
         size /= 1024
 
@@ -180,24 +190,26 @@ def directory_stats(directory: Path) -> Tuple[int, int]:
     if not directory.exists():
         return 0, 0
 
-    count = 0
-    total = 0
+    file_count = 0
+    total_bytes = 0
 
     for path in directory.rglob("*"):
-        if path.is_file():
-            count += 1
-            try:
-                total += path.stat().st_size
-            except OSError:
-                pass
+        if not path.is_file():
+            continue
 
-    return count, total
+        file_count += 1
+        try:
+            total_bytes += path.stat().st_size
+        except OSError:
+            pass
+
+    return file_count, total_bytes
 
 
 def cache_upload_on_server(file_id: str, filename: str, data: bytes) -> Path:
-    target_dir = UPLOAD_CACHE_DIR / file_id
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / sanitize_filename(filename)
+    target_directory = UPLOAD_CACHE_DIR / file_id
+    target_directory.mkdir(parents=True, exist_ok=True)
+    target = target_directory / sanitize_filename(filename)
 
     if not target.exists():
         target.write_bytes(data)
@@ -207,8 +219,8 @@ def cache_upload_on_server(file_id: str, filename: str, data: bytes) -> Path:
 
 def clear_page_uploads() -> None:
     """
-    ปุ่มที่ 1:
-    ล้างภาพและผลบนหน้าปัจจุบัน แต่ไม่ลบแคชบนเซิร์ฟเวอร์
+    ปุ่มที่ 1: ล้างเฉพาะภาพและผลบนหน้าปัจจุบัน
+    ไม่ลบแคชหรือไฟล์ใน APP_CACHE_DIR
     """
     for file_id in list(st.session_state.results.keys()):
         st.session_state.pop(f"title_{file_id}", None)
@@ -218,14 +230,13 @@ def clear_page_uploads() -> None:
     st.session_state.generated_zip = None
     st.session_state.generated_zip_name = ""
     st.session_state.uploader_version += 1
-    st.session_state.flash_message = "ล้างภาพออกจากหน้าอัปโหลดแล้ว"
+    st.session_state.flash_message = "ล้างภาพออกจากหน้าอัปโหลดเรียบร้อยแล้ว"
 
 
 def clear_server_cache() -> Tuple[int, int]:
     """
-    ปุ่มที่ 2:
-    ลบเฉพาะ APP_CACHE_DIR และล้าง cache ใน memory
-    ไม่ล้างภาพที่กำลังแสดงใน file uploader
+    ปุ่มที่ 2: ลบแคชและไฟล์ของแอปบนเซิร์ฟเวอร์
+    ไม่รีเซ็ตภาพที่กำลังแสดงใน file uploader
     """
     file_count, total_bytes = directory_stats(APP_CACHE_DIR)
 
@@ -237,6 +248,7 @@ def clear_server_cache() -> Tuple[int, int]:
 
     st.session_state.analysis_cache = {}
     st.session_state.title_cache = {}
+    st.session_state.quality_cache = {}
     st.session_state.generated_zip = None
     st.session_state.generated_zip_name = ""
 
@@ -248,23 +260,22 @@ def clear_server_cache() -> Tuple[int, int]:
 # =========================================================
 def get_available_models(api_key: str) -> Tuple[List[str], str]:
     """
-    ดึงรายชื่อโมเดลที่ API Key เข้าถึงได้จริง
-    หมายเหตุ: Models API ไม่ได้บอก modality ของแต่ละโมเดลโดยตรง
-    จึงจัดอันดับชื่อที่มีแนวโน้มรองรับ vision ไว้ด้านบน
+    Models API บอกโมเดลที่ Key เข้าถึงได้ แต่ไม่ได้รับรองว่า
+    ทุกโมเดลในรายการรองรับ input_image
     """
     if not api_key.strip():
         return [], ""
 
-    cache_key = hashlib.sha256(
-        f"{api_key[-8:]}:{st.session_state.model_refresh_version}".encode()
-    ).hexdigest()
+    cache_key = stable_hash({
+        "key_tail": api_key[-8:],
+        "refresh": st.session_state.model_refresh_version,
+    })
+    data_key = f"models_{cache_key}"
+    error_key = f"models_error_{cache_key}"
 
-    state_key = f"available_models_{cache_key}"
-    error_key = f"available_models_error_{cache_key}"
-
-    if state_key in st.session_state:
+    if data_key in st.session_state:
         return (
-            st.session_state[state_key],
+            st.session_state[data_key],
             st.session_state.get(error_key, ""),
         )
 
@@ -272,15 +283,13 @@ def get_available_models(api_key: str) -> Tuple[List[str], str]:
         client = OpenAI(api_key=api_key.strip())
         response = client.models.list()
 
-        model_ids = sorted(
-            {
-                model.id
-                for model in response.data
-                if getattr(model, "id", "")
-            }
-        )
+        model_ids = sorted({
+            model.id
+            for model in response.data
+            if getattr(model, "id", "")
+        })
 
-        excluded_fragments = (
+        excluded = (
             "embedding",
             "moderation",
             "whisper",
@@ -288,48 +297,46 @@ def get_available_models(api_key: str) -> Tuple[List[str], str]:
             "audio",
             "realtime",
             "transcribe",
-            "image",
             "dall-e",
             "sora",
         )
 
-        filtered = [
+        candidates = [
             model_id
             for model_id in model_ids
-            if not any(fragment in model_id.lower() for fragment in excluded_fragments)
+            if model_id.startswith("gpt-")
+            and not any(token in model_id.lower() for token in excluded)
         ]
 
-        def model_rank(model_id: str) -> Tuple[int, str]:
-            name = model_id.lower()
+        preferred_exact = [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4o-mini",
+        ]
 
-            preferred_order = [
-                "gpt-5.6",
-                "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5",
-                "gpt-4.1",
-                "gpt-4o",
-            ]
+        def sort_key(model_id: str) -> Tuple[int, str]:
+            if model_id in preferred_exact:
+                return preferred_exact.index(model_id), model_id
 
-            for index, prefix in enumerate(preferred_order):
-                if name == prefix:
-                    return index, name
-                if name.startswith(prefix):
-                    return index + 10, name
+            for index, prefix in enumerate(preferred_exact):
+                if model_id.startswith(prefix):
+                    return index + 20, model_id
 
-            return 100, name
+            return 100, model_id
 
-        filtered.sort(key=model_rank)
+        candidates.sort(key=sort_key)
 
-        st.session_state[state_key] = filtered
+        st.session_state[data_key] = candidates
         st.session_state[error_key] = ""
-        return filtered, ""
+        return candidates, ""
 
     except Exception as error:
-        friendly = redact_secrets(f"{type(error).__name__}: {error}")
-        st.session_state[state_key] = []
-        st.session_state[error_key] = friendly
-        return [], friendly
+        message = redact_secrets(f"{type(error).__name__}: {error}")
+        st.session_state[data_key] = []
+        st.session_state[error_key] = message
+        return [], message
 
 
 def friendly_api_error(error: Exception, model: str) -> str:
@@ -343,15 +350,17 @@ def friendly_api_error(error: Exception, model: str) -> str:
         )
 
     if "invalid_api_key" in lower or "incorrect api key" in lower:
-        return "API Key ไม่ถูกต้อง หรือถูกยกเลิกแล้ว"
+        return "API Key ไม่ถูกต้อง ถูกยกเลิก หรือหมดอายุ"
 
     if "insufficient_quota" in lower or "billing" in lower:
         return "บัญชี API ไม่มีโควตา หรือยังไม่ได้ตั้งค่า Billing"
 
-    if "unsupported" in lower and "image" in lower:
+    if "image" in lower and (
+        "unsupported" in lower or "not support" in lower
+    ):
         return (
-            f"โมเดล '{model}' อาจไม่รองรับ Image Input "
-            "กรุณาเลือกโมเดล GPT ที่รองรับภาพ"
+            f"โมเดล '{model}' ไม่รองรับ Image Input "
+            "กรุณาเลือกโมเดลที่รองรับการวิเคราะห์ภาพ"
         )
 
     return f"{type(error).__name__}: {text}"
@@ -364,10 +373,10 @@ def validate_image(
     data: bytes,
     filename: str,
 ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
-    ext = original_extension(filename)
+    extension = original_extension(filename)
 
-    if ext not in SUPPORTED_EXTENSIONS:
-        return False, f"ไม่รองรับไฟล์ {ext or 'ไม่ทราบชนิด'}", {}
+    if extension not in SUPPORTED_EXTENSIONS:
+        return False, f"ไม่รองรับไฟล์ {extension or 'ไม่ทราบชนิด'}", {}
 
     try:
         with Image.open(io.BytesIO(data)) as image:
@@ -375,18 +384,26 @@ def validate_image(
 
         with Image.open(io.BytesIO(data)) as image:
             image_format = (image.format or "").upper()
-            expected = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG"}[ext]
+            expected_format = {
+                ".jpg": "JPEG",
+                ".jpeg": "JPEG",
+                ".png": "PNG",
+            }[extension]
 
-            if image_format != expected:
+            if image_format != expected_format:
                 return (
                     False,
-                    f"นามสกุลเป็น {ext} แต่ข้อมูลภายในเป็น {image_format or 'unknown'}",
+                    f"นามสกุลเป็น {extension} แต่ข้อมูลภายในเป็น "
+                    f"{image_format or 'unknown'}",
                     {},
                 )
 
             has_transparency = (
                 image.mode in ("RGBA", "LA")
-                or (image.mode == "P" and "transparency" in image.info)
+                or (
+                    image.mode == "P"
+                    and "transparency" in image.info
+                )
             )
 
             return True, None, {
@@ -405,36 +422,43 @@ def validate_image(
 
 def prepare_uploads(uploaded_files: List[Any]) -> List[Dict[str, Any]]:
     payloads: List[Dict[str, Any]] = []
-    seen = set()
+    seen_ids = set()
 
-    for uploaded in uploaded_files:
-        data = uploaded.getvalue()
-        file_id = unique_file_id(uploaded.name, data)
+    for uploaded_file in uploaded_files:
+        data = uploaded_file.getvalue()
+        file_id = unique_file_id(uploaded_file.name, data)
 
-        if file_id in seen:
+        if file_id in seen_ids:
             continue
 
-        seen.add(file_id)
-        valid, error, info = validate_image(data, uploaded.name)
+        seen_ids.add(file_id)
+        valid, validation_error, image_info = validate_image(
+            data,
+            uploaded_file.name,
+        )
 
-        cached_path = ""
+        cache_path = ""
         if valid:
-            cached_path = str(
-                cache_upload_on_server(file_id, uploaded.name, data)
+            cache_path = str(
+                cache_upload_on_server(
+                    file_id,
+                    uploaded_file.name,
+                    data,
+                )
             )
 
         payloads.append({
             "id": file_id,
-            "original_name": uploaded.name,
-            "safe_name": sanitize_filename(uploaded.name),
-            "extension": original_extension(uploaded.name),
+            "original_name": uploaded_file.name,
+            "safe_name": sanitize_filename(uploaded_file.name),
+            "extension": original_extension(uploaded_file.name),
             "bytes": data,
             "size": len(data),
-            "mime": getattr(uploaded, "type", ""),
+            "mime": getattr(uploaded_file, "type", ""),
             "valid": valid,
-            "validation_error": error,
-            "image_info": info,
-            "server_cache_path": cached_path,
+            "validation_error": validation_error,
+            "image_info": image_info,
+            "server_cache_path": cache_path,
         })
 
     return payloads
@@ -442,22 +466,32 @@ def prepare_uploads(uploaded_files: List[Any]) -> List[Dict[str, Any]]:
 
 def optimize_for_analysis(data: bytes) -> bytes:
     """
-    ย่อเฉพาะสำเนาสำหรับส่ง AI
-    ไม่แตะไฟล์ต้นฉบับที่ใช้ Export
+    ย่อเฉพาะสำเนาที่ส่ง AI
+    ไฟล์ต้นฉบับสำหรับ Export ไม่ถูก resize
     """
     with Image.open(io.BytesIO(data)) as source:
         image = ImageOps.exif_transpose(source)
 
         if image.mode in ("RGBA", "LA"):
             rgba = image.convert("RGBA")
-            white = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-            white.alpha_composite(rgba)
-            image = white.convert("RGB")
+            background = Image.new(
+                "RGBA",
+                rgba.size,
+                (255, 255, 255, 255),
+            )
+            background.alpha_composite(rgba)
+            image = background.convert("RGB")
+
         elif image.mode == "P" and "transparency" in image.info:
             rgba = image.convert("RGBA")
-            white = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
-            white.alpha_composite(rgba)
-            image = white.convert("RGB")
+            background = Image.new(
+                "RGBA",
+                rgba.size,
+                (255, 255, 255, 255),
+            )
+            background.alpha_composite(rgba)
+            image = background.convert("RGB")
+
         elif image.mode != "RGB":
             image = image.convert("RGB")
 
@@ -466,19 +500,19 @@ def optimize_for_analysis(data: bytes) -> bytes:
             Image.Resampling.LANCZOS,
         )
 
-        output = io.BytesIO()
+        buffer = io.BytesIO()
         image.save(
-            output,
+            buffer,
             format="JPEG",
             quality=ANALYSIS_JPEG_QUALITY,
             optimize=True,
             subsampling=0,
         )
-        return output.getvalue()
+        return buffer.getvalue()
 
 
 # =========================================================
-# 7) KEYWORDS AND TITLE
+# 7) KEYWORD / TITLE VALIDATION
 # =========================================================
 def split_keywords(raw: Any) -> List[str]:
     if isinstance(raw, list):
@@ -498,12 +532,32 @@ def split_keywords(raw: Any) -> List[str]:
     return []
 
 
+def contains_blacklist_term(
+    text: str,
+    blacklist: List[str],
+) -> bool:
+    normalized_text = f" {re.sub(r'[^a-z0-9 ]+', ' ', text.lower())} "
+
+    for blocked in blacklist:
+        normalized_blocked = re.sub(
+            r"[^a-z0-9 ]+",
+            " ",
+            blocked.lower(),
+        ).strip()
+
+        if normalized_blocked and (
+            f" {normalized_blocked} " in normalized_text
+        ):
+            return True
+
+    return False
+
+
 def normalize_keywords(
     raw: Any,
     blacklist: List[str],
     limit: int = KEYWORD_LIMIT,
 ) -> str:
-    blocked = {item.lower() for item in blacklist}
     cleaned: List[str] = []
     seen = set()
 
@@ -511,11 +565,13 @@ def normalize_keywords(
         keyword = keyword.strip(" ,;:.")
         key = keyword.lower()
 
-        if not keyword or key in seen or key in blocked:
+        if not keyword or key in seen:
+            continue
+        if contains_blacklist_term(keyword, blacklist):
             continue
         if len(keyword) > 80:
             continue
-        if any(char in keyword for char in "#@\\|{}[]<>"):
+        if any(character in keyword for character in "#@\\|{}[]<>"):
             continue
 
         seen.add(key)
@@ -539,58 +595,297 @@ def keyword_count(keywords: str) -> int:
     return len(keyword_list(keywords))
 
 
-def normalize_match_text(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]+", " ", text.lower()).strip()
+def canonical_search_text(text: str) -> str:
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        text.lower(),
+    ).strip()
 
 
-def top_keywords_in_title(title: str, keywords: str) -> List[str]:
-    title_words = set(normalize_match_text(title).split())
-    matched: List[str] = []
+def keyword_exactly_in_title(keyword: str, title: str) -> bool:
+    """
+    ตรวจ keyword แบบ exact phrase โดยไม่สนตัวพิมพ์ใหญ่เล็ก
+    และยอมให้ punctuation คั่นคำได้
+    """
+    keyword_normalized = canonical_search_text(keyword)
+    title_normalized = canonical_search_text(title)
 
-    for keyword in keyword_list(keywords)[:TOP_KEYWORD_COUNT]:
-        parts = [
-            part
-            for part in normalize_match_text(keyword).split()
-            if len(part) >= 3
-        ]
+    if not keyword_normalized or not title_normalized:
+        return False
 
-        if not parts:
-            continue
+    return (
+        f" {keyword_normalized} "
+        in f" {title_normalized} "
+    )
 
-        required = 1 if len(parts) == 1 else min(2, len(parts))
 
-        if sum(part in title_words for part in parts) >= required:
-            matched.append(keyword)
+def top_keyword_coverage(
+    title: str,
+    keywords: str,
+) -> Dict[str, Any]:
+    top_ten = keyword_list(keywords)[:TOP_KEYWORD_COUNT]
+    found = [
+        keyword
+        for keyword in top_ten
+        if keyword_exactly_in_title(keyword, title)
+    ]
+    missing = [
+        keyword
+        for keyword in top_ten
+        if keyword not in found
+    ]
 
-    return matched
+    return {
+        "top_ten": top_ten,
+        "found": found,
+        "missing": missing,
+        "count": len(found),
+        "complete": (
+            len(top_ten) == TOP_KEYWORD_COUNT
+            and len(found) == TOP_KEYWORD_COUNT
+        ),
+    }
+
+
+def duplicate_keywords(keywords: str) -> List[str]:
+    values = [
+        item.lower()
+        for item in keyword_list(keywords)
+    ]
+
+    return sorted({
+        item
+        for item in values
+        if values.count(item) > 1
+    })
+
+
+def deterministic_quality_check(
+    title: str,
+    keywords: str,
+    blacklist: List[str],
+    ai_review: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    คะแนนเต็ม 100:
+    - Keywords ครบ 49: 20
+    - Top 10 อยู่ใน Title ครบ: 35
+    - Title length: 10
+    - ไม่มี Keyword ซ้ำ: 10
+    - ไม่มี Blacklist: 10
+    - AI relevance/naturalness: 15
+    """
+    cleaned_title = normalize_title(title)
+    cleaned_keywords = normalize_keywords(
+        keywords,
+        blacklist=[],
+        limit=999,
+    )
+
+    count = keyword_count(cleaned_keywords)
+    duplicates = duplicate_keywords(cleaned_keywords)
+    coverage = top_keyword_coverage(
+        cleaned_title,
+        cleaned_keywords,
+    )
+
+    title_blacklisted = contains_blacklist_term(
+        cleaned_title,
+        blacklist,
+    )
+
+    blocked_keywords = [
+        keyword
+        for keyword in keyword_list(cleaned_keywords)
+        if contains_blacklist_term(keyword, blacklist)
+    ]
+
+    title_length_ok = (
+        TITLE_MIN_LENGTH
+        <= len(cleaned_title)
+        <= TITLE_MAX_LENGTH
+    )
+
+    score_breakdown = {
+        "keyword_count": 20 if count == KEYWORD_LIMIT else max(
+            0,
+            20 - abs(KEYWORD_LIMIT - count) * 2,
+        ),
+        "top_10_coverage": round(
+            35 * (coverage["count"] / TOP_KEYWORD_COUNT)
+        ) if coverage["top_ten"] else 0,
+        "title_length": 10 if title_length_ok else 0,
+        "no_duplicates": 10 if not duplicates else 0,
+        "no_blacklist": 10 if (
+            not title_blacklisted
+            and not blocked_keywords
+        ) else 0,
+        "ai_quality": 0,
+    }
+
+    ai_relevance = None
+    ai_naturalness = None
+    ai_accuracy = None
+    ai_notes: List[str] = []
+
+    if ai_review:
+        ai_relevance = int(ai_review.get("relevance_score", 0) or 0)
+        ai_naturalness = int(ai_review.get("naturalness_score", 0) or 0)
+        ai_accuracy = int(ai_review.get("keyword_accuracy_score", 0) or 0)
+        ai_notes = [
+            normalize_spaces(note)
+            for note in ai_review.get("notes", [])
+            if normalize_spaces(note)
+        ][:5]
+
+        average_ai = (
+            ai_relevance
+            + ai_naturalness
+            + ai_accuracy
+        ) / 3
+
+        score_breakdown["ai_quality"] = round(
+            15 * (average_ai / 10)
+        )
+
+    total_score = min(
+        100,
+        sum(score_breakdown.values()),
+    )
+
+    hard_requirements = {
+        "keywords_49": count == KEYWORD_LIMIT,
+        "top_10_complete": coverage["complete"],
+        "title_within_200": (
+            0 < len(cleaned_title) <= TITLE_MAX_LENGTH
+        ),
+        "no_duplicates": not duplicates,
+        "no_blacklist": (
+            not title_blacklisted
+            and not blocked_keywords
+        ),
+        "ai_relevance_pass": (
+            ai_relevance is None
+            or ai_relevance >= 7
+        ),
+        "ai_naturalness_pass": (
+            ai_naturalness is None
+            or ai_naturalness >= 7
+        ),
+        "ai_keyword_accuracy_pass": (
+            ai_accuracy is None
+            or ai_accuracy >= 7
+        ),
+    }
+
+    all_hard_pass = all(hard_requirements.values())
+
+    if all_hard_pass and total_score >= 90:
+        status = "ผ่าน — พร้อม Export"
+        level = "success"
+    elif (
+        coverage["complete"]
+        and count == KEYWORD_LIMIT
+        and total_score >= 75
+    ):
+        status = "ควรตรวจสอบเพิ่มเติม"
+        level = "warning"
+    else:
+        status = "ไม่ผ่าน — ควรแก้ก่อน Export"
+        level = "error"
+
+    issues: List[str] = []
+
+    if count != KEYWORD_LIMIT:
+        issues.append(
+            f"Keywords มี {count}/{KEYWORD_LIMIT} คำ"
+        )
+
+    if not coverage["complete"]:
+        issues.append(
+            "10 Keywords แรกยังอยู่ใน Title ไม่ครบ: "
+            + ", ".join(coverage["missing"])
+        )
+
+    if not title_length_ok:
+        issues.append(
+            f"Title ควรยาว {TITLE_MIN_LENGTH}–"
+            f"{TITLE_MAX_LENGTH} ตัวอักษร "
+            f"(ปัจจุบัน {len(cleaned_title)})"
+        )
+
+    if duplicates:
+        issues.append(
+            "มี Keyword ซ้ำ: "
+            + ", ".join(duplicates[:10])
+        )
+
+    if title_blacklisted or blocked_keywords:
+        issues.append(
+            "พบคำ Blacklist ใน Title หรือ Keywords"
+        )
+
+    if ai_relevance is not None and ai_relevance < 7:
+        issues.append("AI ประเมินว่า Metadata ยังไม่ตรงภาพพอ")
+
+    if ai_naturalness is not None and ai_naturalness < 7:
+        issues.append("AI ประเมินว่า Title ยังไม่เป็นธรรมชาติพอ")
+
+    if ai_accuracy is not None and ai_accuracy < 7:
+        issues.append("AI ประเมินว่า Keywords บางคำอาจไม่แม่นยำ")
+
+    return {
+        "score": total_score,
+        "status": status,
+        "level": level,
+        "score_breakdown": score_breakdown,
+        "hard_requirements": hard_requirements,
+        "issues": issues,
+        "keyword_count": count,
+        "duplicates": duplicates,
+        "blocked_keywords": blocked_keywords,
+        "title_length": len(cleaned_title),
+        "title_length_ok": title_length_ok,
+        "coverage": coverage,
+        "ai_relevance": ai_relevance,
+        "ai_naturalness": ai_naturalness,
+        "ai_keyword_accuracy": ai_accuracy,
+        "ai_notes": ai_notes,
+    }
 
 
 # =========================================================
-# 8) OPENAI REQUEST HELPERS
+# 8) OPENAI HELPERS
 # =========================================================
 def extract_json(raw_text: str) -> Dict[str, Any]:
     text = (raw_text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(r"\s*```$", "", text)
 
     try:
-        value = json.loads(text)
-        if isinstance(value, dict):
-            return value
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
 
-    match = re.search(r"\{.*\}", text, flags=re.S)
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
 
     if not match:
-        raise ValueError("ไม่พบ JSON ในผลลัพธ์")
+        raise ValueError("ไม่พบ JSON ในผลลัพธ์ของโมเดล")
 
-    value = json.loads(match.group(0))
+    parsed = json.loads(match.group(0))
 
-    if not isinstance(value, dict):
-        raise ValueError("JSON ไม่ใช่ object")
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON output ไม่ใช่ object")
 
-    return value
+    return parsed
 
 
 def call_openai(
@@ -613,11 +908,20 @@ def call_openai(
             last_error = error
 
             if attempt < retries - 1:
-                time.sleep(1.5 * (2 ** attempt))
+                time.sleep(1.5 * (2**attempt))
 
     raise last_error or RuntimeError("OpenAI request failed")
 
 
+def image_data_url(data: bytes) -> str:
+    optimized = optimize_for_analysis(data)
+    encoded = base64.b64encode(optimized).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+# =========================================================
+# 9) PROMPTS
+# =========================================================
 def metadata_prompt(
     category_name: str,
     category_num: int,
@@ -625,93 +929,157 @@ def metadata_prompt(
     blacklist: List[str],
 ) -> str:
     return f"""
-You are a professional Adobe Stock contributor and metadata editor.
+You are a senior Adobe Stock metadata editor.
 
-Analyze the uploaded image accurately.
+Analyze the image accurately and create high-quality searchable metadata.
 
-Selected Adobe category: {category_name}
-Category ID: {category_num}
-User context: {hint.strip() if hint.strip() else "None"}
-Forbidden words: {", ".join(blacklist) if blacklist else "None"}
+SELECTED CATEGORY
+- {category_name}
+- Category ID: {category_num}
 
-WORKFLOW
-1. Generate exactly 49 English keywords, ordered from most important to least important.
-2. The first 10 keywords must capture the primary subject, action, setting,
-   important visual attributes, and strongest commercial concepts.
-3. After finalizing those keywords, write the title from the meaning and
-   search intent of the first 10 keywords.
-4. The title must read naturally. Do not paste keywords together.
+OPTIONAL USER CONTEXT
+{hint.strip() if hint.strip() else "None"}
 
-TITLE RULES
-- Exactly one English title.
-- Clear, natural, fluent, descriptive, and commercially useful.
-- Prefer 100–200 characters and never exceed 200.
+FORBIDDEN TERMS
+{", ".join(blacklist) if blacklist else "None"}
+
+MANDATORY WORKFLOW
+
+STEP 1 — KEYWORDS
+Generate exactly 49 unique English keywords ordered from most important
+to least important.
+
+The first 10 keywords have a special requirement:
+- They must be the strongest search terms for the visible image.
+- Keep them concise enough to fit naturally inside one title.
+- Prefer single words or short phrases.
+- Do not make the first 10 synonyms of the same concept.
+- Together they should cover the subject, action, setting,
+  visual attributes, and commercial concept.
+- Every one of these first 10 keywords must later appear verbatim
+  in the title, ignoring capitalization and punctuation.
+
+STEP 2 — TITLE
+After the 49 keywords are finalized, write one English stock title.
+
+The title must:
+- Contain every first-10 keyword verbatim.
+- Remain natural, grammatical, clear, and easy to understand.
+- Never look like a raw keyword list.
 - Put the main subject and action early.
-- Do not start with "Image of", "Photo of", or "Picture of".
-- No brands, logos, trademarks, celebrities, copyrighted names,
-  or unsupported details.
-- Avoid keyword stuffing and excessive commas.
+- Prefer 100–200 characters.
+- Never exceed 200 characters.
+- Avoid excessive commas.
+- Not begin with “Image of”, “Photo of”, or “Picture of”.
+- Not add details unsupported by the visible image.
+- Not contain brands, trademarks, logos, celebrities,
+  copyrighted characters, or forbidden terms.
 
-KEYWORD RULES
-- Exactly 49 English keywords.
-- Most important first.
-- Relevant and stock-search friendly.
-- Avoid irrelevant filler and unnecessary duplication.
-- No brands, trademarks, copyrighted names, or celebrity names.
+Before returning:
+- Count all keywords and confirm there are exactly 49.
+- Confirm the first 10 all appear verbatim in the title.
+- Rewrite internally until both conditions are true.
 
 Return valid JSON only:
+
 {{
-  "title": "natural English stock title",
-  "keywords": ["keyword 1", "keyword 2"],
+  "title": "natural stock title containing all first 10 keywords",
+  "keywords": [
+    "keyword 1",
+    "keyword 2",
+    "keyword 3"
+  ],
   "quality_notes": [],
   "risk_notes": []
 }}
 """.strip()
 
 
-def title_only_prompt(
+def title_repair_prompt(
     keywords: str,
     current_title: str,
+    missing_keywords: List[str],
     hint: str,
-    blacklist: List[str],
 ) -> str:
-    top_ten = ", ".join(keyword_list(keywords)[:TOP_KEYWORD_COUNT])
+    top_ten = keyword_list(keywords)[:TOP_KEYWORD_COUNT]
 
     return f"""
-You are a professional Adobe Stock title editor.
+You are a senior Adobe Stock title editor.
 
-Top 10 keywords in priority order:
-{top_ten}
+TOP 10 KEYWORDS — all must appear verbatim in the new title:
+{", ".join(top_ten)}
 
-Optional context:
+KEYWORDS CURRENTLY MISSING FROM THE TITLE:
+{", ".join(missing_keywords) if missing_keywords else "None"}
+
+CURRENT TITLE:
+{current_title or "None"}
+
+OPTIONAL CONTEXT:
 {hint.strip() if hint.strip() else "None"}
 
-Current title:
-{current_title.strip() if current_title.strip() else "None"}
+Write one improved English stock title.
 
-Forbidden words:
-{", ".join(blacklist) if blacklist else "None"}
-
-Create exactly one NEW English stock title.
-
-Requirements:
-- Use the meaning and strongest search intent of the top 10 keywords.
-- Prioritize the earliest keywords.
-- Sound natural, clear, descriptive, and human-written.
-- Do not paste keywords together.
+Mandatory rules:
+- Include all 10 supplied keywords verbatim, ignoring capitalization.
+- Keep the title natural, grammatical, readable, and human-written.
+- Do not output a keyword list.
 - Put the main subject and action early.
-- Prefer 100–200 characters and never exceed 200.
-- Avoid unsupported details, brands, trademarks, copyrighted names,
-  celebrities, and excessive commas.
-- The new title should differ meaningfully from the current title.
+- Do not invent unsupported details.
+- Prefer 100–200 characters.
+- Never exceed 200 characters.
+- Avoid excessive commas.
+- Return a title meaningfully improved from the current title.
 
 Return valid JSON only:
-{{"title": "new natural English stock title"}}
+{{"title": "new title"}}
 """.strip()
 
 
-def analyze_image(
-    data: bytes,
+def quality_review_prompt(
+    title: str,
+    keywords: str,
+) -> str:
+    return f"""
+You are a strict Adobe Stock metadata quality reviewer.
+
+Review the supplied title and keywords against the uploaded image.
+
+TITLE
+{title}
+
+KEYWORDS
+{keywords}
+
+Evaluate:
+1. relevance_score: How accurately the title describes the visible image.
+2. naturalness_score: How natural, clear, and grammatical the title is.
+3. keyword_accuracy_score: How relevant and non-misleading the keywords are.
+
+Scoring:
+- Integer from 0 to 10.
+- 10 means excellent.
+- Be strict. Unsupported concepts must reduce the score.
+
+Also return up to 5 short actionable notes.
+
+Do not rewrite the metadata.
+Return valid JSON only:
+
+{{
+  "relevance_score": 0,
+  "naturalness_score": 0,
+  "keyword_accuracy_score": 0,
+  "notes": []
+}}
+""".strip()
+
+
+# =========================================================
+# 10) AI OPERATIONS
+# =========================================================
+def generate_metadata(
+    image_bytes: bytes,
     api_key: str,
     model: str,
     category_name: str,
@@ -721,8 +1089,6 @@ def analyze_image(
 ) -> Dict[str, Any]:
     try:
         client = OpenAI(api_key=api_key)
-        optimized = optimize_for_analysis(data)
-        image_b64 = base64.b64encode(optimized).decode("utf-8")
 
         response = call_openai(
             client=client,
@@ -741,12 +1107,12 @@ def analyze_image(
                     },
                     {
                         "type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{image_b64}",
+                        "image_url": image_data_url(image_bytes),
                         "detail": "high",
                     },
                 ],
             }],
-            max_output_tokens=1500,
+            max_output_tokens=1800,
         )
 
         raw = (response.output_text or "").strip()
@@ -764,6 +1130,50 @@ def analyze_image(
         if not keywords:
             raise ValueError("โมเดลไม่ได้สร้าง Keywords")
 
+        # ตรวจและแก้ Title อัตโนมัติ เพื่อให้ Top 10 ครบ 10/10
+        repair_history: List[Dict[str, Any]] = []
+
+        for attempt in range(1, MAX_TITLE_REPAIR_ATTEMPTS + 1):
+            coverage = top_keyword_coverage(title, keywords)
+
+            if coverage["complete"] and len(title) <= TITLE_MAX_LENGTH:
+                break
+
+            repair_response = call_openai(
+                client=client,
+                model=model,
+                input_payload=[{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": title_repair_prompt(
+                            keywords=keywords,
+                            current_title=title,
+                            missing_keywords=coverage["missing"],
+                            hint=hint,
+                        ),
+                    }],
+                }],
+                max_output_tokens=450,
+            )
+
+            repaired_raw = (
+                repair_response.output_text or ""
+            ).strip()
+
+            new_title = normalize_title(
+                extract_json(repaired_raw).get("title", "")
+            )
+
+            if new_title:
+                title = new_title
+
+            repair_history.append({
+                "attempt": attempt,
+                "missing_before": coverage["missing"],
+                "title_after": title,
+            })
+
         return {
             "title": title,
             "keywords": keywords,
@@ -777,40 +1187,120 @@ def analyze_image(
                 if isinstance(parsed.get("risk_notes", []), list)
                 else []
             ),
+            "repair_history": repair_history,
             "raw": raw,
             "error": False,
             "error_message": "",
         }
 
     except Exception as error:
-        friendly = friendly_api_error(error, model)
+        message = friendly_api_error(error, model)
 
         return {
             "title": "",
             "keywords": "",
             "quality_notes": [],
             "risk_notes": [],
-            "raw": friendly,
+            "repair_history": [],
+            "raw": message,
             "error": True,
-            "error_message": friendly,
+            "error_message": message,
         }
 
 
-def regenerate_title(
+def regenerate_title_until_valid(
     keywords: str,
     current_title: str,
     api_key: str,
     model: str,
     hint: str,
-    blacklist: List[str],
 ) -> Dict[str, Any]:
     if keyword_count(keywords) < TOP_KEYWORD_COUNT:
         return {
             "title": current_title,
+            "attempts": 0,
             "error": True,
             "error_message": "ต้องมีอย่างน้อย 10 Keywords ก่อน",
         }
 
+    try:
+        client = OpenAI(api_key=api_key)
+        title = normalize_title(current_title)
+        attempts = 0
+
+        for attempt in range(1, MAX_TITLE_REPAIR_ATTEMPTS + 1):
+            coverage = top_keyword_coverage(title, keywords)
+
+            if (
+                coverage["complete"]
+                and 0 < len(title) <= TITLE_MAX_LENGTH
+                and attempt > 1
+            ):
+                break
+
+            response = call_openai(
+                client=client,
+                model=model,
+                input_payload=[{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": title_repair_prompt(
+                            keywords=keywords,
+                            current_title=title,
+                            missing_keywords=coverage["missing"],
+                            hint=hint,
+                        ),
+                    }],
+                }],
+                max_output_tokens=450,
+            )
+
+            generated_title = normalize_title(
+                extract_json(
+                    response.output_text or ""
+                ).get("title", "")
+            )
+
+            if generated_title:
+                title = generated_title
+
+            attempts = attempt
+
+            final_coverage = top_keyword_coverage(
+                title,
+                keywords,
+            )
+
+            if (
+                final_coverage["complete"]
+                and len(title) <= TITLE_MAX_LENGTH
+            ):
+                break
+
+        return {
+            "title": title,
+            "attempts": attempts,
+            "error": False,
+            "error_message": "",
+        }
+
+    except Exception as error:
+        return {
+            "title": current_title,
+            "attempts": 0,
+            "error": True,
+            "error_message": friendly_api_error(error, model),
+        }
+
+
+def ai_quality_review(
+    image_bytes: bytes,
+    title: str,
+    keywords: str,
+    api_key: str,
+    model: str,
+) -> Dict[str, Any]:
     try:
         client = OpenAI(api_key=api_key)
 
@@ -819,68 +1309,92 @@ def regenerate_title(
             model=model,
             input_payload=[{
                 "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": title_only_prompt(
-                        keywords,
-                        current_title,
-                        hint,
-                        blacklist,
-                    ),
-                }],
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": quality_review_prompt(
+                            title,
+                            keywords,
+                        ),
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_url(image_bytes),
+                        "detail": "high",
+                    },
+                ],
             }],
-            max_output_tokens=400,
+            max_output_tokens=500,
         )
 
-        raw = (response.output_text or "").strip()
-        title = normalize_title(extract_json(raw).get("title", ""))
+        parsed = extract_json(
+            response.output_text or ""
+        )
 
-        if not title:
-            raise ValueError("โมเดลไม่ได้สร้าง Title ใหม่")
-
-        if len(title) > TITLE_MAX_LENGTH:
-            shortened = title[:TITLE_MAX_LENGTH]
-            title = shortened.rsplit(" ", 1)[0].rstrip(" ,;:-.")
+        def bounded_score(key: str) -> int:
+            try:
+                return max(
+                    0,
+                    min(10, int(parsed.get(key, 0))),
+                )
+            except Exception:
+                return 0
 
         return {
-            "title": title,
+            "relevance_score": bounded_score(
+                "relevance_score"
+            ),
+            "naturalness_score": bounded_score(
+                "naturalness_score"
+            ),
+            "keyword_accuracy_score": bounded_score(
+                "keyword_accuracy_score"
+            ),
+            "notes": (
+                parsed.get("notes", [])[:5]
+                if isinstance(parsed.get("notes", []), list)
+                else []
+            ),
             "error": False,
             "error_message": "",
         }
 
     except Exception as error:
         return {
-            "title": current_title,
+            "relevance_score": 0,
+            "naturalness_score": 0,
+            "keyword_accuracy_score": 0,
+            "notes": [],
             "error": True,
             "error_message": friendly_api_error(error, model),
         }
 
 
 # =========================================================
-# 9) EXPORT
+# 11) EXPORT HELPERS
 # =========================================================
 def export_jpeg(
     data: bytes,
     title: str,
     keywords: str,
-    ext: str,
+    extension: str,
 ) -> bytes:
-    temp_path = None
+    temp_path: Optional[str] = None
 
     try:
         with tempfile.NamedTemporaryFile(
-            suffix=".jpeg" if ext == ".jpeg" else ".jpg",
+            suffix=".jpeg" if extension == ".jpeg" else ".jpg",
             delete=False,
-        ) as temp_file:
-            temp_file.write(data)
-            temp_path = temp_file.name
+        ) as temporary_file:
+            temporary_file.write(data)
+            temp_path = temporary_file.name
 
         info = IPTCInfo(temp_path, force=True)
         info["object name"] = title.encode("utf-8")
         info["caption/abstract"] = title.encode("utf-8")
         info["keywords"] = [
-            item.encode("utf-8")
-            for item in keyword_list(keywords)
+            keyword.encode("utf-8")
+            for keyword in keyword_list(keywords)
         ]
         info.save()
 
@@ -891,7 +1405,10 @@ def export_jpeg(
 
     finally:
         if temp_path:
-            for path in (Path(temp_path), Path(temp_path + "~")):
+            for path in (
+                Path(temp_path),
+                Path(temp_path + "~"),
+            ):
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
@@ -906,7 +1423,6 @@ def export_png(
     try:
         with Image.open(io.BytesIO(data)) as source:
             source.load()
-
             original_size = source.size
             original_has_alpha = (
                 source.mode in ("RGBA", "LA")
@@ -945,7 +1461,9 @@ def export_png(
             }
 
             if source.info.get("icc_profile"):
-                save_options["icc_profile"] = source.info["icc_profile"]
+                save_options["icc_profile"] = (
+                    source.info["icc_profile"]
+                )
 
             if source.info.get("dpi"):
                 save_options["dpi"] = source.info["dpi"]
@@ -954,7 +1472,9 @@ def export_png(
                 source.mode in ("P", "L", "RGB")
                 and "transparency" in source.info
             ):
-                save_options["transparency"] = source.info["transparency"]
+                save_options["transparency"] = (
+                    source.info["transparency"]
+                )
 
             output = io.BytesIO()
             source.save(output, **save_options)
@@ -983,21 +1503,30 @@ def export_png(
 
 def export_image(
     data: bytes,
-    ext: str,
+    extension: str,
     title: str,
     keywords: str,
 ) -> bytes:
-    if ext in {".jpg", ".jpeg"}:
-        return export_jpeg(data, title, keywords, ext)
+    if extension in {".jpg", ".jpeg"}:
+        return export_jpeg(
+            data,
+            title,
+            keywords,
+            extension,
+        )
 
-    if ext == ".png":
-        return export_png(data, title, keywords)
+    if extension == ".png":
+        return export_png(
+            data,
+            title,
+            keywords,
+        )
 
     return data
 
 
 # =========================================================
-# 10) SIDEBAR
+# 12) SIDEBAR
 # =========================================================
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -1006,19 +1535,31 @@ with st.sidebar:
         "🔑 OpenAI API Key",
         value="",
         type="password",
-        placeholder="ไม่ต้องกรอก หากตั้งค่า OPENAI_API_KEY แล้ว",
+        placeholder=(
+            "ไม่ต้องกรอก หากตั้ง OPENAI_API_KEY แล้ว"
+        ),
     )
 
-    env_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    env_api_key = os.getenv(
+        "OPENAI_API_KEY",
+        "",
+    ).strip()
 
     try:
         secret_api_key = str(
-            st.secrets.get("OPENAI_API_KEY", "")
+            st.secrets.get(
+                "OPENAI_API_KEY",
+                "",
+            )
         ).strip()
     except Exception:
         secret_api_key = ""
 
-    api_key = manual_api_key.strip() or env_api_key or secret_api_key
+    api_key = (
+        manual_api_key.strip()
+        or env_api_key
+        or secret_api_key
+    )
 
     if st.button(
         "🔄 รีเฟรชรายการโมเดล",
@@ -1027,7 +1568,9 @@ with st.sidebar:
         st.session_state.model_refresh_version += 1
         st.rerun()
 
-    available_models, model_error = get_available_models(api_key)
+    available_models, model_error = (
+        get_available_models(api_key)
+    )
 
     if available_models:
         model_choice = st.selectbox(
@@ -1035,12 +1578,10 @@ with st.sidebar:
             options=available_models,
             index=0,
             help=(
-                "Models API แสดงสิทธิ์เข้าถึง แต่ไม่ได้ยืนยันว่า "
-                "ทุกโมเดลรองรับ Image Input"
+                "Models API บอกสิทธิ์เข้าถึง "
+                "แต่บางโมเดลอาจไม่รองรับ input_image"
             ),
         )
-
-        st.caption(f"กำลังใช้: {model_choice}")
 
         use_custom_model = st.checkbox(
             "กรอก Model ID เอง",
@@ -1056,7 +1597,7 @@ with st.sidebar:
     else:
         if model_error:
             st.warning(
-                "ยังดึงรายการโมเดลไม่ได้: "
+                "ดึงรายการโมเดลไม่ได้: "
                 + redact_secrets(model_error)
             )
 
@@ -1064,8 +1605,8 @@ with st.sidebar:
             "🤖 Model ID",
             value="gpt-4.1",
             help=(
-                "กรอกโมเดลที่บัญชีเข้าถึงได้จริง "
-                "หรือใส่ API Key แล้วกดรีเฟรชรายการโมเดล"
+                "ใส่ API Key แล้วกดรีเฟรช "
+                "เพื่อดูโมเดลที่บัญชีเข้าถึงได้จริง"
             ),
         ).strip()
 
@@ -1078,7 +1619,10 @@ with st.sidebar:
 
     hint = st.text_area(
         "💡 Context Hint",
-        placeholder="เช่น young woman stretching before tennis workout",
+        placeholder=(
+            "เช่น young woman stretching "
+            "before tennis workout"
+        ),
     )
 
     blacklist_raw = st.text_area(
@@ -1087,9 +1631,24 @@ with st.sidebar:
     )
     blacklist = parse_blacklist(blacklist_raw)
 
+    auto_ai_review = st.checkbox(
+        "ให้ AI ตรวจความตรงภาพหลังสร้างอัตโนมัติ",
+        value=True,
+        help=(
+            "แม่นขึ้น แต่มี API cost เพิ่มอีกหนึ่ง request ต่อภาพ"
+        ),
+    )
+
+    prevent_failed_export = st.checkbox(
+        "ไม่ให้ Export ภาพที่ไม่ผ่านคุณภาพ",
+        value=True,
+    )
+
     st.divider()
 
-    server_files, server_bytes = directory_stats(APP_CACHE_DIR)
+    server_files, server_bytes = directory_stats(
+        APP_CACHE_DIR
+    )
 
     st.caption(
         f"Server cache: {server_files:,} files • "
@@ -1106,16 +1665,18 @@ with st.sidebar:
         use_container_width=True,
         disabled=not confirm_cleanup,
     ):
-        deleted_files, deleted_bytes = clear_server_cache()
+        deleted_files, deleted_bytes = (
+            clear_server_cache()
+        )
 
         st.success(
-            f"ล้างแล้ว {deleted_files:,} ไฟล์ "
+            f"ล้างแล้ว {deleted_files:,} ไฟล์ • "
             f"คืนพื้นที่ {human_size(deleted_bytes)}"
         )
 
 
 # =========================================================
-# 11) MAIN UI
+# 13) MAIN UI
 # =========================================================
 try:
     if st.session_state.flash_message:
@@ -1123,7 +1684,8 @@ try:
         st.session_state.flash_message = ""
 
     uploader_key = (
-        f"image_uploader_{st.session_state.uploader_version}"
+        f"image_uploader_"
+        f"{st.session_state.uploader_version}"
     )
 
     uploaded_files = st.file_uploader(
@@ -1142,38 +1704,38 @@ try:
     action_col1, action_col2 = st.columns(2)
 
     with action_col1:
-        analyze_all = st.button(
-            "🚀 วิเคราะห์ภาพทั้งหมด",
+        analyze_all_clicked = st.button(
+            "🚀 วิเคราะห์และตรวจคุณภาพทั้งหมด",
             type="primary",
             use_container_width=True,
             disabled=not payloads,
         )
 
     with action_col2:
-        clear_page = st.button(
+        clear_page_clicked = st.button(
             "🗑️ ล้างภาพออกจากหน้าอัปโหลด",
             use_container_width=True,
             disabled=not payloads,
             help=(
                 "ล้างเฉพาะภาพและผลในหน้านี้ "
-                "ไม่ลบไฟล์แคชบนเซิร์ฟเวอร์"
+                "ไม่ลบแคชบนเซิร์ฟเวอร์"
             ),
         )
 
-    if clear_page:
+    if clear_page_clicked:
         clear_page_uploads()
         st.rerun()
 
-    if analyze_all:
+    if analyze_all_clicked:
         if not api_key:
             st.error("กรุณาใส่ OpenAI API Key")
         elif not model_choice:
             st.error("กรุณาเลือกหรือกรอก Model ID")
         else:
             valid_payloads = [
-                item
-                for item in payloads
-                if item["valid"]
+                payload
+                for payload in payloads
+                if payload["valid"]
             ]
 
             progress = st.progress(0)
@@ -1184,33 +1746,34 @@ try:
                 start=1,
             ):
                 status.info(
-                    f"กำลังวิเคราะห์ "
+                    f"กำลังสร้าง Metadata "
                     f"{index}/{len(valid_payloads)}: "
                     f"{payload['original_name']}"
                 )
 
-                cache_signature = json.dumps(
-                    {
-                        "file_hash": sha256_bytes(payload["bytes"]),
-                        "model": model_choice,
-                        "category": category_num,
-                        "hint": hint,
-                        "blacklist": blacklist,
-                        "version": 6,
-                    },
-                    sort_keys=True,
-                    ensure_ascii=False,
-                )
+                generation_cache_key = stable_hash({
+                    "file_hash": sha256_bytes(
+                        payload["bytes"]
+                    ),
+                    "model": model_choice,
+                    "category": category_num,
+                    "hint": hint,
+                    "blacklist": blacklist,
+                    "prompt_version": 8,
+                })
 
-                cache_key = hashlib.sha256(
-                    cache_signature.encode("utf-8")
-                ).hexdigest()
-
-                if cache_key in st.session_state.analysis_cache:
-                    result = st.session_state.analysis_cache[cache_key]
+                if (
+                    generation_cache_key
+                    in st.session_state.analysis_cache
+                ):
+                    generated = (
+                        st.session_state.analysis_cache[
+                            generation_cache_key
+                        ]
+                    )
                 else:
-                    result = analyze_image(
-                        data=payload["bytes"],
+                    generated = generate_metadata(
+                        image_bytes=payload["bytes"],
                         api_key=api_key,
                         model=model_choice,
                         category_name=category_name,
@@ -1218,30 +1781,92 @@ try:
                         hint=hint,
                         blacklist=blacklist,
                     )
-                    st.session_state.analysis_cache[cache_key] = result
+                    st.session_state.analysis_cache[
+                        generation_cache_key
+                    ] = generated
+
+                ai_review: Optional[Dict[str, Any]] = None
+
+                if (
+                    auto_ai_review
+                    and not generated["error"]
+                ):
+                    status.info(
+                        f"กำลังตรวจความตรงภาพ "
+                        f"{index}/{len(valid_payloads)}: "
+                        f"{payload['original_name']}"
+                    )
+
+                    review_cache_key = stable_hash({
+                        "file_hash": sha256_bytes(
+                            payload["bytes"]
+                        ),
+                        "title": generated["title"],
+                        "keywords": generated["keywords"],
+                        "model": model_choice,
+                        "review_version": 3,
+                    })
+
+                    if (
+                        review_cache_key
+                        in st.session_state.quality_cache
+                    ):
+                        ai_review = (
+                            st.session_state.quality_cache[
+                                review_cache_key
+                            ]
+                        )
+                    else:
+                        ai_review = ai_quality_review(
+                            image_bytes=payload["bytes"],
+                            title=generated["title"],
+                            keywords=generated["keywords"],
+                            api_key=api_key,
+                            model=model_choice,
+                        )
+                        st.session_state.quality_cache[
+                            review_cache_key
+                        ] = ai_review
+
+                quality = deterministic_quality_check(
+                    title=generated["title"],
+                    keywords=generated["keywords"],
+                    blacklist=blacklist,
+                    ai_review=(
+                        ai_review
+                        if ai_review
+                        and not ai_review.get("error")
+                        else None
+                    ),
+                )
 
                 st.session_state.results[payload["id"]] = {
                     **payload,
-                    **result,
+                    **generated,
                     "category": category_num,
+                    "ai_review": ai_review,
+                    "quality": quality,
                 }
 
                 st.session_state[
                     f"title_{payload['id']}"
-                ] = result["title"]
+                ] = generated["title"]
 
                 st.session_state[
                     f"keywords_{payload['id']}"
-                ] = result["keywords"]
+                ] = generated["keywords"]
 
                 progress.progress(
                     index / max(len(valid_payloads), 1)
                 )
 
-            status.success("วิเคราะห์เรียบร้อย")
+            status.success(
+                "สร้างและตรวจคุณภาพเรียบร้อย"
+            )
             st.rerun()
 
     final_items: List[Dict[str, Any]] = []
+    failed_items: List[str] = []
 
     for payload in payloads:
         with st.container(border=True):
@@ -1255,31 +1880,40 @@ try:
                     payload["bytes"],
                     use_container_width=True,
                 )
-
                 st.caption(payload["original_name"])
 
                 if payload["valid"]:
                     info = payload["image_info"]
 
                     st.caption(
-                        f"{info['width']:,} × {info['height']:,} px • "
-                        f"{info['mode']} • {human_size(payload['size'])}"
+                        f"{info['width']:,} × "
+                        f"{info['height']:,} px • "
+                        f"{info['mode']} • "
+                        f"{human_size(payload['size'])}"
                     )
 
                     if info["has_transparency"]:
-                        st.success("PNG โปร่งใส")
+                        st.success(
+                            "PNG โปร่งใส — Export คง Alpha"
+                        )
                 else:
-                    st.error(payload["validation_error"])
+                    st.error(
+                        payload["validation_error"]
+                    )
 
             with detail_col:
                 if not payload["valid"]:
                     continue
 
                 file_id = payload["id"]
-                result = st.session_state.results.get(file_id)
+                result = st.session_state.results.get(
+                    file_id
+                )
 
                 if not result:
-                    st.info("ยังไม่ได้วิเคราะห์ภาพนี้")
+                    st.info(
+                        "ยังไม่ได้วิเคราะห์ภาพนี้"
+                    )
                     continue
 
                 if result.get("error"):
@@ -1303,15 +1937,13 @@ try:
                 keywords_key = f"keywords_{file_id}"
 
                 if title_key not in st.session_state:
-                    st.session_state[title_key] = result.get(
-                        "title",
-                        "",
+                    st.session_state[title_key] = (
+                        result.get("title", "")
                     )
 
                 if keywords_key not in st.session_state:
-                    st.session_state[keywords_key] = result.get(
-                        "keywords",
-                        "",
+                    st.session_state[keywords_key] = (
+                        result.get("keywords", "")
                     )
 
                 edited_title = st.text_area(
@@ -1326,168 +1958,356 @@ try:
                     height=150,
                 )
 
-                cleaned_title = normalize_title(edited_title)
+                cleaned_title = normalize_title(
+                    edited_title
+                )
                 cleaned_keywords = normalize_keywords(
                     edited_keywords,
-                    blacklist,
+                    blacklist=[],
+                    limit=999,
                 )
 
-                st.session_state.results[file_id]["title"] = (
-                    cleaned_title
-                )
+                st.session_state.results[file_id][
+                    "title"
+                ] = cleaned_title
 
-                st.session_state.results[file_id]["keywords"] = (
-                    cleaned_keywords
-                )
+                st.session_state.results[file_id][
+                    "keywords"
+                ] = cleaned_keywords
 
-                button_col1, button_col2 = st.columns(2)
+                button_col1, button_col2, button_col3 = (
+                    st.columns(3)
+                )
 
                 with button_col1:
-                    if st.button(
-                        "✨ สร้าง Title ใหม่เฉพาะภาพนี้",
-                        key=f"new_title_{file_id}",
+                    regenerate_clicked = st.button(
+                        "✨ สร้าง Title ใหม่",
+                        key=f"regenerate_{file_id}",
                         use_container_width=True,
-                    ):
-                        if not api_key:
-                            st.error("กรุณาใส่ OpenAI API Key")
-                        elif not model_choice:
-                            st.error("กรุณาเลือก Model")
-                        else:
-                            title_signature = json.dumps(
-                                {
-                                    "keywords": cleaned_keywords,
-                                    "current_title": cleaned_title,
-                                    "model": model_choice,
-                                    "hint": hint,
-                                    "blacklist": blacklist,
-                                    "version": 6,
-                                },
-                                sort_keys=True,
-                                ensure_ascii=False,
-                            )
+                    )
 
-                            title_cache_key = hashlib.sha256(
-                                title_signature.encode("utf-8")
-                            ).hexdigest()
+                with button_col2:
+                    quality_clicked = st.button(
+                        "✅ ตรวจคุณภาพใหม่",
+                        key=f"quality_{file_id}",
+                        use_container_width=True,
+                    )
 
-                            if (
-                                title_cache_key
-                                in st.session_state.title_cache
-                            ):
-                                title_result = (
-                                    st.session_state.title_cache[
-                                        title_cache_key
-                                    ]
-                                )
-                            else:
-                                title_result = regenerate_title(
+                with button_col3:
+                    delete_result_clicked = st.button(
+                        "🗑️ ลบผลภาพนี้",
+                        key=f"delete_{file_id}",
+                        use_container_width=True,
+                    )
+
+                if regenerate_clicked:
+                    if not api_key:
+                        st.error(
+                            "กรุณาใส่ OpenAI API Key"
+                        )
+                    else:
+                        with st.spinner(
+                            "กำลังสร้างและตรวจ Title ใหม่..."
+                        ):
+                            regenerated = (
+                                regenerate_title_until_valid(
                                     keywords=cleaned_keywords,
                                     current_title=cleaned_title,
                                     api_key=api_key,
                                     model=model_choice,
                                     hint=hint,
-                                    blacklist=blacklist,
                                 )
+                            )
 
-                                st.session_state.title_cache[
-                                    title_cache_key
-                                ] = title_result
-
-                            if title_result["error"]:
-                                st.error(
-                                    redact_secrets(
-                                        title_result[
-                                            "error_message"
-                                        ]
-                                    )
+                        if regenerated["error"]:
+                            st.error(
+                                redact_secrets(
+                                    regenerated[
+                                        "error_message"
+                                    ]
                                 )
-                            else:
-                                new_title = title_result["title"]
+                            )
+                        else:
+                            new_title = regenerated["title"]
 
-                                st.session_state.results[
-                                    file_id
-                                ]["title"] = new_title
+                            st.session_state.results[
+                                file_id
+                            ]["title"] = new_title
 
-                                st.session_state[
-                                    title_key
-                                ] = new_title
+                            st.session_state[
+                                title_key
+                            ] = new_title
 
-                                st.rerun()
+                            # AI review เก่าหมดอายุ
+                            st.session_state.results[
+                                file_id
+                            ]["ai_review"] = None
 
-                with button_col2:
-                    if st.button(
-                        "🗑️ ลบผลวิเคราะห์ภาพนี้",
-                        key=f"remove_result_{file_id}",
-                        use_container_width=True,
-                    ):
-                        st.session_state.results.pop(
-                            file_id,
-                            None,
+                            st.rerun()
+
+                if quality_clicked:
+                    ai_review = None
+
+                    if not api_key:
+                        st.warning(
+                            "ไม่ได้ใส่ API Key: "
+                            "จะตรวจเฉพาะกฎพื้นฐาน"
                         )
-                        st.session_state.pop(title_key, None)
-                        st.session_state.pop(keywords_key, None)
-                        st.rerun()
+                    else:
+                        with st.spinner(
+                            "กำลังตรวจความตรงกับภาพ..."
+                        ):
+                            ai_review = ai_quality_review(
+                                image_bytes=payload["bytes"],
+                                title=cleaned_title,
+                                keywords=cleaned_keywords,
+                                api_key=api_key,
+                                model=model_choice,
+                            )
 
-                matched_top = top_keywords_in_title(
-                    cleaned_title,
-                    cleaned_keywords,
+                        if ai_review["error"]:
+                            st.error(
+                                redact_secrets(
+                                    ai_review[
+                                        "error_message"
+                                    ]
+                                )
+                            )
+                            ai_review = None
+
+                    quality = deterministic_quality_check(
+                        title=cleaned_title,
+                        keywords=cleaned_keywords,
+                        blacklist=blacklist,
+                        ai_review=ai_review,
+                    )
+
+                    st.session_state.results[file_id][
+                        "ai_review"
+                    ] = ai_review
+
+                    st.session_state.results[file_id][
+                        "quality"
+                    ] = quality
+
+                    st.rerun()
+
+                if delete_result_clicked:
+                    st.session_state.results.pop(
+                        file_id,
+                        None,
+                    )
+                    st.session_state.pop(
+                        title_key,
+                        None,
+                    )
+                    st.session_state.pop(
+                        keywords_key,
+                        None,
+                    )
+                    st.rerun()
+
+                # คำนวณใหม่ทันทีทุกครั้งที่ผู้ใช้แก้ข้อความ
+                ai_review = result.get("ai_review")
+
+                quality = deterministic_quality_check(
+                    title=cleaned_title,
+                    keywords=cleaned_keywords,
+                    blacklist=blacklist,
+                    ai_review=(
+                        ai_review
+                        if ai_review
+                        and not ai_review.get("error")
+                        else None
+                    ),
                 )
 
-                metric1, metric2, metric3 = st.columns(3)
+                st.session_state.results[file_id][
+                    "quality"
+                ] = quality
+
+                metric1, metric2, metric3, metric4 = (
+                    st.columns(4)
+                )
 
                 metric1.metric(
-                    "Keywords",
-                    f"{keyword_count(cleaned_keywords)}/{KEYWORD_LIMIT}",
+                    "Quality Score",
+                    f"{quality['score']}/100",
                 )
-
                 metric2.metric(
+                    "Keywords",
+                    f"{quality['keyword_count']}/49",
+                )
+                metric3.metric(
                     "Top 10 ใน Title",
-                    f"{len(matched_top)}/{TOP_KEYWORD_COUNT}",
+                    f"{quality['coverage']['count']}/10",
+                )
+                metric4.metric(
+                    "Title Length",
+                    f"{quality['title_length']}/200",
                 )
 
-                metric3.metric(
-                    "Title length",
-                    len(cleaned_title),
-                )
+                if quality["level"] == "success":
+                    st.success(quality["status"])
+                elif quality["level"] == "warning":
+                    st.warning(quality["status"])
+                else:
+                    st.error(quality["status"])
 
                 with st.expander(
-                    "ตรวจสอบ 10 Keywords แรก"
+                    "🔎 รายละเอียดการตรวจคุณภาพ",
+                    expanded=(
+                        quality["level"] != "success"
+                    ),
                 ):
-                    top_ten = keyword_list(
-                        cleaned_keywords
-                    )[:TOP_KEYWORD_COUNT]
+                    st.markdown("**10 Keywords แรก**")
+                    st.write(
+                        ", ".join(
+                            quality["coverage"][
+                                "top_ten"
+                            ]
+                        )
+                        or "-"
+                    )
 
-                    st.write("10 Keywords แรก:")
-                    st.write(", ".join(top_ten) or "-")
+                    st.markdown(
+                        "**พบใน Title แบบตรงคำ**"
+                    )
+                    st.write(
+                        ", ".join(
+                            quality["coverage"][
+                                "found"
+                            ]
+                        )
+                        or "-"
+                    )
 
-                    st.write("คำที่ตรวจพบใน Title:")
-                    st.write(", ".join(matched_top) or "-")
+                    st.markdown(
+                        "**คำที่ยังขาดจาก Title**"
+                    )
+                    st.write(
+                        ", ".join(
+                            quality["coverage"][
+                                "missing"
+                            ]
+                        )
+                        or "ไม่มี — ครบ 10/10"
+                    )
 
-                final_items.append({
-                    "Filename": payload["safe_name"],
-                    "Title": cleaned_title,
-                    "Keywords": cleaned_keywords,
-                    "Category": category_num,
-                    "Releases": "",
-                    "bytes": payload["bytes"],
-                    "extension": payload["extension"],
-                })
+                    st.markdown("**คะแนนแยกส่วน**")
+                    breakdown_df = pd.DataFrame([
+                        {
+                            "หัวข้อ": key,
+                            "คะแนน": value,
+                        }
+                        for key, value in (
+                            quality[
+                                "score_breakdown"
+                            ].items()
+                        )
+                    ])
+
+                    st.dataframe(
+                        breakdown_df,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    if quality["issues"]:
+                        st.markdown(
+                            "**สิ่งที่ต้องแก้**"
+                        )
+                        for issue in quality["issues"]:
+                            st.write(f"• {issue}")
+
+                    if (
+                        quality["ai_relevance"]
+                        is not None
+                    ):
+                        st.markdown(
+                            "**AI Quality Review**"
+                        )
+                        st.write(
+                            "ความตรงภาพ: "
+                            f"{quality['ai_relevance']}/10"
+                        )
+                        st.write(
+                            "ความเป็นธรรมชาติ: "
+                            f"{quality['ai_naturalness']}/10"
+                        )
+                        st.write(
+                            "ความแม่นยำ Keywords: "
+                            f"{quality['ai_keyword_accuracy']}/10"
+                        )
+
+                        for note in quality["ai_notes"]:
+                            st.write(f"• {note}")
+                    else:
+                        st.info(
+                            "ยังไม่มี AI Review "
+                            "กด “ตรวจคุณภาพใหม่” "
+                            "เพื่อตรวจความตรงกับภาพ"
+                        )
+
+                export_allowed = (
+                    quality["level"] == "success"
+                    or not prevent_failed_export
+                )
+
+                if export_allowed:
+                    final_items.append({
+                        "File ID": file_id,
+                        "Filename": payload["safe_name"],
+                        "Title": cleaned_title,
+                        "Keywords": cleaned_keywords,
+                        "Category": category_num,
+                        "Releases": "",
+                        "Quality Score": quality["score"],
+                        "Quality Status": quality["status"],
+                        "Top 10 Coverage": (
+                            quality["coverage"]["count"]
+                        ),
+                        "bytes": payload["bytes"],
+                        "extension": payload["extension"],
+                    })
+                else:
+                    failed_items.append(
+                        payload["original_name"]
+                    )
+
+    # =====================================================
+    # 14) EXPORT
+    # =====================================================
+    if failed_items and prevent_failed_export:
+        st.warning(
+            "ภาพที่ยังไม่ผ่านและถูกกันออกจาก Export: "
+            + ", ".join(failed_items)
+        )
 
     if final_items:
         st.divider()
         st.subheader("📦 Export")
 
-        export_df = pd.DataFrame(final_items)[
-            [
-                "Filename",
-                "Title",
-                "Keywords",
-                "Category",
-                "Releases",
-            ]
-        ]
+        adobe_df = pd.DataFrame(final_items)[[
+            "Filename",
+            "Title",
+            "Keywords",
+            "Category",
+            "Releases",
+        ]]
 
-        csv_bytes = export_df.to_csv(
+        quality_df = pd.DataFrame(final_items)[[
+            "Filename",
+            "Quality Score",
+            "Quality Status",
+            "Top 10 Coverage",
+        ]]
+
+        csv_bytes = adobe_df.to_csv(
+            index=False
+        ).encode("utf-8-sig")
+
+        quality_csv_bytes = quality_df.to_csv(
             index=False
         ).encode("utf-8-sig")
 
@@ -1495,7 +2315,7 @@ try:
 
         with export_col1:
             st.download_button(
-                "📊 Download CSV",
+                "📊 Download Adobe CSV",
                 data=csv_bytes,
                 file_name="adobe_stock_metadata.csv",
                 mime="text/csv",
@@ -1503,75 +2323,104 @@ try:
             )
 
         with export_col2:
-            if st.button(
+            create_zip_clicked = st.button(
                 "📦 สร้าง ZIP พร้อม Metadata",
                 use_container_width=True,
-            ):
-                zip_buffer = io.BytesIO()
+            )
 
-                with zipfile.ZipFile(
-                    zip_buffer,
-                    "w",
-                    zipfile.ZIP_DEFLATED,
-                ) as archive:
-                    archive.writestr(
-                        "adobe_stock_metadata.csv",
-                        csv_bytes,
-                    )
+        if create_zip_clicked:
+            zip_buffer = io.BytesIO()
 
-                    used_names: Dict[str, int] = {}
-
-                    for item in final_items:
-                        filename = item["Filename"]
-                        path = Path(filename)
-                        duplicate_index = used_names.get(
-                            filename.lower(),
-                            0,
-                        ) + 1
-                        used_names[filename.lower()] = duplicate_index
-
-                        if duplicate_index > 1:
-                            filename = (
-                                f"{path.stem}_{duplicate_index}"
-                                f"{path.suffix}"
-                            )
-
-                        exported = export_image(
-                            data=item["bytes"],
-                            ext=item["extension"],
-                            title=item["Title"],
-                            keywords=item["Keywords"],
-                        )
-
-                        archive.writestr(
-                            filename,
-                            exported,
-                        )
-
-                zip_bytes = zip_buffer.getvalue()
-                export_name = (
-                    f"adobe_stock_package_{int(time.time())}.zip"
+            with zipfile.ZipFile(
+                zip_buffer,
+                "w",
+                zipfile.ZIP_DEFLATED,
+            ) as archive:
+                archive.writestr(
+                    "adobe_stock_metadata.csv",
+                    csv_bytes,
+                )
+                archive.writestr(
+                    "metadata_quality_report.csv",
+                    quality_csv_bytes,
                 )
 
-                export_path = EXPORT_CACHE_DIR / export_name
-                export_path.write_bytes(zip_bytes)
+                used_names: Dict[str, int] = {}
 
-                st.session_state.generated_zip = zip_bytes
-                st.session_state.generated_zip_name = export_name
+                for item in final_items:
+                    filename = item["Filename"]
+                    filename_key = filename.lower()
+                    occurrence = (
+                        used_names.get(
+                            filename_key,
+                            0,
+                        )
+                        + 1
+                    )
+                    used_names[filename_key] = occurrence
+
+                    if occurrence > 1:
+                        path = Path(filename)
+                        filename = (
+                            f"{path.stem}_{occurrence}"
+                            f"{path.suffix}"
+                        )
+
+                    exported = export_image(
+                        data=item["bytes"],
+                        extension=item["extension"],
+                        title=item["Title"],
+                        keywords=item["Keywords"],
+                    )
+
+                    archive.writestr(
+                        filename,
+                        exported,
+                    )
+
+            zip_bytes = zip_buffer.getvalue()
+            export_name = (
+                f"adobe_stock_package_"
+                f"{int(time.time())}.zip"
+            )
+
+            export_path = (
+                EXPORT_CACHE_DIR / export_name
+            )
+            export_path.write_bytes(zip_bytes)
+
+            st.session_state.generated_zip = (
+                zip_bytes
+            )
+            st.session_state.generated_zip_name = (
+                export_name
+            )
 
         if st.session_state.generated_zip:
             st.download_button(
                 "📂 Download ZIP",
                 data=st.session_state.generated_zip,
-                file_name=st.session_state.generated_zip_name,
+                file_name=(
+                    st.session_state
+                    .generated_zip_name
+                ),
                 mime="application/zip",
                 type="primary",
                 use_container_width=True,
             )
 
-        with st.expander("ดูตาราง CSV"):
+        with st.expander("ดู Adobe CSV"):
             st.dataframe(
-                export_df,
+                adobe_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with st.expander(
+            "ดู Quality Report"
+        ):
+            st.dataframe(
+                quality_df,
                 use_container_width=True,
                 hide_index=True,
             )

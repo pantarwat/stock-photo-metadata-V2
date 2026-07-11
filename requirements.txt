@@ -1,6 +1,5 @@
-streamlit
-pandas
-Pillow
-piexif
-openai
-iptcinfo3
+streamlit>=1.40,<2
+openai>=1.68,<3
+pydantic>=2.8,<3
+Pillow>=10.4,<13
+IPTCInfo3>=2.3,<3

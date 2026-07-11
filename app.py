@@ -1,2493 +1,3134 @@
+from __future__ import annotations
+
+"""
+AI Stock Vision V2.4 — Single-file Streamlit application
+
+Run:
+    pip install -r requirements.txt
+    streamlit run app.py
+
+Security:
+    Never hard-code or commit OPENAI_API_KEY.
+"""
+
+# ========================================================================================
+# Inlined from: core/config.py
+# ========================================================================================
+
+import tempfile
+from pathlib import Path
+
+APP_NAME = "AI Stock Vision V2.4 — Single File"
+PROMPT_VERSION = "v2.4.0-single-file"
+ANALYSIS_MAX_LONG_EDGE = 1800
+TOKEN_LADDER = (2400, 3600, 5000)
+TITLE_REPAIR_MAX_ATTEMPTS = 3
+
+# Model selection
+# AUTO_MODEL_OPTION is a UI/internal sentinel and is never sent to the API.
+AUTO_MODEL_OPTION = "__auto_best_compatible__"
+DEFAULT_MODEL_ID = "gpt-5.6"
+LEGACY_VISION_FALLBACK_MODEL_ID = "gpt-4.1"
+USER_REQUESTED_MODEL_ID = "gpt-4.6"
+DEFAULT_AI_REVIEW_THRESHOLD = 75
+DEFAULT_USD_TO_THB = 35.0
+
+# Ordered from highest expected metadata quality to lower-cost / older fallbacks.
+# A candidate is only preferred automatically when the API key can see it.
+MODEL_QUALITY_PRIORITY = (
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    # Compatibility only: attempted only when selected or returned by the API.
+    "gpt-4.6",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4o",
+    "gpt-4o-mini",
+)
+
+# Used only when model discovery cannot run. Each candidate is attempted safely;
+# model-not-found / unsupported-image errors automatically move to the next one.
+MODEL_DISCOVERY_FAILURE_CHAIN = (
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4o-mini",
+)
+
+APP_CACHE_DIR = Path(tempfile.gettempdir()) / "ai_stock_vision_cache"
+ANALYSIS_CACHE_DIR = APP_CACHE_DIR / "analysis"
+TITLE_CACHE_DIR = APP_CACHE_DIR / "title"
+QUALITY_CACHE_DIR = APP_CACHE_DIR / "quality"
+EXPORT_CACHE_DIR = APP_CACHE_DIR / "exports"
+
+CACHE_DIRS = (
+    ANALYSIS_CACHE_DIR,
+    TITLE_CACHE_DIR,
+    QUALITY_CACHE_DIR,
+    EXPORT_CACHE_DIR,
+)
+
+DEFAULT_BLACKLIST = {
+    "adobe stock",
+    "shutterstock",
+    "getty images",
+    "istock",
+    "alamy",
+    "dreamstime",
+    "depositphotos",
+    "copyright",
+    "copyrighted",
+    "trademark",
+    "watermark",
+    "logo",
+    "brand",
+    "branded",
+    "celebrity",
+    "famous person",
+    "ai generated",
+    "generative ai",
+    "midjourney",
+    "dall-e",
+    "stable diffusion",
+}
+
+OBVIOUS_NON_VISION_MODEL_TOKENS = (
+    "embedding",
+    "whisper",
+    "tts",
+    "audio",
+    "transcribe",
+    "moderation",
+    "realtime",
+    "search-preview",
+    "image-1",
+    "sora",
+    "codex",
+    "-pro",
+    "chat",
+)
+
+# ========================================================================================
+# Inlined from: core/cache.py
+# ========================================================================================
+
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+
+def ensure_cache_dirs() -> None:
+    for directory in CACHE_DIRS:
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+def make_cache_key(*parts: object) -> str:
+    payload = "|".join(str(part) for part in parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def cache_path(directory: Path, *parts: object) -> Path:
+    ensure_cache_dirs()
+    key = make_cache_key(PROMPT_VERSION, *parts)
+    return directory / f"{key}.json"
+
+
+def read_json(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.exists():
+            return None
+        with path.open("r", encoding="utf-8") as file:
+            value = json.load(file)
+        return value if isinstance(value, dict) else None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.stem}_", suffix=".tmp", dir=path.parent
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        temp_path.replace(path)
+    finally:
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def directory_stats(path: Path) -> tuple[int, int]:
+    file_count = 0
+    total_bytes = 0
+    if not path.exists():
+        return file_count, total_bytes
+    for item in path.rglob("*"):
+        if item.is_file():
+            file_count += 1
+            try:
+                total_bytes += item.stat().st_size
+            except OSError:
+                pass
+    return file_count, total_bytes
+
+
+def clear_app_cache() -> tuple[int, int]:
+    """Delete only this application's cache directory and recreate safe subfolders."""
+    expected = (Path(tempfile.gettempdir()) / "ai_stock_vision_cache").resolve()
+    actual = APP_CACHE_DIR.resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+
+    if actual != expected or actual == temp_root or temp_root not in actual.parents:
+        raise RuntimeError("ปฏิเสธการล้างแคช: ตำแหน่งโฟลเดอร์ไม่ผ่านการตรวจสอบความปลอดภัย")
+
+    file_count, total_bytes = directory_stats(APP_CACHE_DIR)
+    if APP_CACHE_DIR.exists():
+        shutil.rmtree(APP_CACHE_DIR)
+    ensure_cache_dirs()
+    return file_count, total_bytes
+
+
+def human_bytes(size: int) -> str:
+    value = float(max(size, 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} B"
+
+# ========================================================================================
+# Inlined from: core/image_utils.py
+# ========================================================================================
+
 import base64
 import hashlib
 import io
-import json
-import os
-import re
-import shutil
-import tempfile
-import time
-import traceback
-import zipfile
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-import pandas as pd
-import streamlit as st
 from PIL import Image, ImageOps, UnidentifiedImageError
-from PIL.PngImagePlugin import PngInfo
-from iptcinfo3 import IPTCInfo
-from openai import OpenAI
-from pydantic import BaseModel, Field, ValidationError
 
-
-# =========================================================
-# 1) PAGE CONFIG
-# =========================================================
-st.set_page_config(
-    page_title="AI Stock Vision Pro",
-    page_icon="🎯",
-    layout="wide",
-)
-
-st.title("🎯 AI Stock Vision Pro")
-st.caption(
-    "สร้างและตรวจคุณภาพ Adobe Stock Metadata • "
-    "49 Keywords • 10 Keywords แรกต้องอยู่ใน Title ครบ 10/10"
-)
-
-
-# =========================================================
-# 2) CONSTANTS
-# =========================================================
-CATEGORY_DICT = {
-    "1. Animals: สัตว์ แมลง สัตว์เลี้ยง": 1,
-    "2. Buildings and Architecture: บ้าน อาคาร งานออกแบบภายใน วัด โรงงาน": 2,
-    "3. Business: คนทำงาน สำนักงาน แนวคิดทางธุรกิจ การเงิน": 3,
-    "4. Drinks: เครื่องดื่ม วัฒนธรรมการดื่ม แอลกอฮอล์": 4,
-    "5. The Environment: ธรรมชาติ สถานที่ทำงานและที่อยู่อาศัย": 5,
-    "6. States of Mind: อารมณ์ ความรู้สึก ความคิดภายในจิตใจ": 6,
-    "7. Food: อาหาร การกิน วัตถุดิบ": 7,
-    "8. Graphic Resources: พื้นหลัง พื้นผิว สัญลักษณ์ต่างๆ": 8,
-    "9. Hobbies and Leisure: กิจกรรมยามว่าง การพักผ่อน งานอดิเรก": 9,
-    "10. Industry: งานอุตสาหกรรม การผลิต พลังงาน": 10,
-    "11. Landscape: ทิวทัศน์ เมือง วิวธรรมชาติ": 11,
-    "12. Lifestyle: กิจกรรมในชีวิตประจำวันของคนในสถานที่ต่างๆ": 12,
-    "13. People: ผู้คนทุกช่วงวัย เชื้อชาติ และความหลากหลาย": 13,
-    "14. Plants and Flowers: พืชพรรณ ดอกไม้ การจัดสวน": 14,
-    "15. Culture and Religion: ประเพณี ความเชื่อ วัฒนธรรมทั่วโลก": 15,
-    "16. Science: วิทยาศาสตร์ การแพทย์ การวิจัย": 16,
-    "17. Social Issues: ปัญหาสังคม การเมือง ความยากจน": 17,
-    "18. Sports: กีฬา การออกกำลังกาย สันทนาการ": 18,
-    "19. Technology: คอมพิวเตอร์ สมาร์ทโฟน AI และนวัตกรรม": 19,
-    "20. Transport: ยานพาหนะ ระบบขนส่ง รถ รถไฟ เครื่องบิน": 20,
-    "21. Travel: การท่องเที่ยว วัฒนธรรมท้องถิ่น สถานที่ท่องเที่ยว": 21,
-}
-
-DEFAULT_BLACKLIST = (
-    "nike, apple, adidas, disney, marvel, coca-cola, samsung, sony, "
-    "tesla, iphone, ipad, macbook, logo, trademark, celebrity"
-)
-
-KEYWORD_LIMIT = 49
-TOP_KEYWORD_COUNT = 10
-TITLE_MIN_LENGTH = 70
-TITLE_MAX_LENGTH = 200
-MAX_TITLE_REPAIR_ATTEMPTS = 3
-ANALYSIS_MAX_SIDE = 1800
-ANALYSIS_JPEG_QUALITY = 90
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
-
-# แอปลบได้เฉพาะโฟลเดอร์นี้เท่านั้น
-APP_CACHE_DIR = Path(
-    os.getenv(
-        "AI_STOCK_CACHE_DIR",
-        str(Path(tempfile.gettempdir()) / "ai_stock_vision_cache"),
-    )
-)
-UPLOAD_CACHE_DIR = APP_CACHE_DIR / "uploads"
-EXPORT_CACHE_DIR = APP_CACHE_DIR / "exports"
-
-for directory in (UPLOAD_CACHE_DIR, EXPORT_CACHE_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
-
-
-# =========================================================
-# 3) SESSION STATE
-# =========================================================
-DEFAULT_STATE = {
-    "results": {},
-    "analysis_cache": {},
-    "title_cache": {},
-    "quality_cache": {},
-    "uploader_version": 0,
-    "generated_zip": None,
-    "generated_zip_name": "",
-    "flash_message": "",
-    "model_refresh_version": 0,
-}
-
-for state_key, default_value in DEFAULT_STATE.items():
-    if state_key not in st.session_state:
-        st.session_state[state_key] = default_value
-
-
-# =========================================================
-# 4) SECURITY / GENERAL HELPERS
-# =========================================================
-def redact_secrets(value: Any) -> str:
-    text = str(value or "")
-    for pattern in (
-        r"sk-proj-[A-Za-z0-9_-]+",
-        r"sk-[A-Za-z0-9_-]+",
-    ):
-        text = re.sub(pattern, "[REDACTED_OPENAI_API_KEY]", text)
-    return text
-
-
-def normalize_spaces(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def normalize_title(value: Any) -> str:
-    return normalize_spaces(value).strip(" ,;:-")
-
-
-def parse_blacklist(raw_text: str) -> List[str]:
-    return [
-        normalize_spaces(item).lower()
-        for item in raw_text.split(",")
-        if normalize_spaces(item)
-    ]
 
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def stable_hash(payload: Dict[str, Any]) -> str:
-    serialized = json.dumps(
-        payload,
-        sort_keys=True,
-        ensure_ascii=False,
-        default=str,
-    )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-
-def original_extension(filename: str) -> str:
-    extension = Path(filename).suffix.lower()
-    return ".jpg" if extension == ".jpe" else extension
-
-
-def sanitize_filename(filename: str) -> str:
-    path = Path(os.path.basename(filename))
-    extension = path.suffix.lower()
-
-    if extension not in SUPPORTED_EXTENSIONS:
-        extension = ".jpg"
-
-    stem = re.sub(r"[^\w\-. ]+", "_", path.stem, flags=re.UNICODE)
-    stem = re.sub(r"\s+", " ", stem).strip(" ._-") or "image"
-    return f"{stem}{extension}"
-
-
-def unique_file_id(filename: str, data: bytes) -> str:
-    return f"{sanitize_filename(filename)}__{sha256_bytes(data)[:16]}"
-
-
-def human_size(size_bytes: int) -> str:
-    size = float(size_bytes)
-
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
-            return f"{size:.2f} {unit}"
-        size /= 1024
-
-    return f"{size_bytes} B"
-
-
-def directory_stats(directory: Path) -> Tuple[int, int]:
-    if not directory.exists():
-        return 0, 0
-
-    file_count = 0
-    total_bytes = 0
-
-    for path in directory.rglob("*"):
-        if not path.is_file():
-            continue
-
-        file_count += 1
-        try:
-            total_bytes += path.stat().st_size
-        except OSError:
-            pass
-
-    return file_count, total_bytes
-
-
-def cache_upload_on_server(file_id: str, filename: str, data: bytes) -> Path:
-    target_directory = UPLOAD_CACHE_DIR / file_id
-    target_directory.mkdir(parents=True, exist_ok=True)
-    target = target_directory / sanitize_filename(filename)
-
-    if not target.exists():
-        target.write_bytes(data)
-
-    return target
-
-
-def clear_page_uploads() -> None:
-    """
-    ปุ่มที่ 1: ล้างเฉพาะภาพและผลบนหน้าปัจจุบัน
-    ไม่ลบแคชหรือไฟล์ใน APP_CACHE_DIR
-    """
-    for file_id in list(st.session_state.results.keys()):
-        st.session_state.pop(f"title_{file_id}", None)
-        st.session_state.pop(f"keywords_{file_id}", None)
-
-    st.session_state.results = {}
-    st.session_state.generated_zip = None
-    st.session_state.generated_zip_name = ""
-    st.session_state.uploader_version += 1
-    st.session_state.flash_message = "ล้างภาพออกจากหน้าอัปโหลดเรียบร้อยแล้ว"
-
-
-def clear_server_cache() -> Tuple[int, int]:
-    """
-    ปุ่มที่ 2: ลบแคชและไฟล์ของแอปบนเซิร์ฟเวอร์
-    ไม่รีเซ็ตภาพที่กำลังแสดงใน file uploader
-    """
-    file_count, total_bytes = directory_stats(APP_CACHE_DIR)
-
-    if APP_CACHE_DIR.exists():
-        shutil.rmtree(APP_CACHE_DIR)
-
-    UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    EXPORT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    st.session_state.analysis_cache = {}
-    st.session_state.title_cache = {}
-    st.session_state.quality_cache = {}
-    st.session_state.generated_zip = None
-    st.session_state.generated_zip_name = ""
-
-    return file_count, total_bytes
-
-
-# =========================================================
-# 5) MODEL DISCOVERY
-# =========================================================
-def get_available_models(api_key: str) -> Tuple[List[str], str]:
-    """
-    Models API บอกโมเดลที่ Key เข้าถึงได้ แต่ไม่ได้รับรองว่า
-    ทุกโมเดลในรายการรองรับ input_image
-    """
-    if not api_key.strip():
-        return [], ""
-
-    cache_key = stable_hash({
-        "key_tail": api_key[-8:],
-        "refresh": st.session_state.model_refresh_version,
-    })
-    data_key = f"models_{cache_key}"
-    error_key = f"models_error_{cache_key}"
-
-    if data_key in st.session_state:
-        return (
-            st.session_state[data_key],
-            st.session_state.get(error_key, ""),
-        )
-
-    try:
-        client = OpenAI(api_key=api_key.strip())
-        response = client.models.list()
-
-        model_ids = sorted({
-            model.id
-            for model in response.data
-            if getattr(model, "id", "")
-        })
-
-        excluded = (
-            "embedding",
-            "moderation",
-            "whisper",
-            "tts",
-            "audio",
-            "realtime",
-            "transcribe",
-            "dall-e",
-            "sora",
-        )
-
-        candidates = [
-            model_id
-            for model_id in model_ids
-            if model_id.startswith("gpt-")
-            and not any(token in model_id.lower() for token in excluded)
-        ]
-
-        preferred_exact = [
-            "gpt-5",
-            "gpt-5-mini",
-            "gpt-4.1",
-            "gpt-4o",
-            "gpt-4o-mini",
-        ]
-
-        def sort_key(model_id: str) -> Tuple[int, str]:
-            if model_id in preferred_exact:
-                return preferred_exact.index(model_id), model_id
-
-            for index, prefix in enumerate(preferred_exact):
-                if model_id.startswith(prefix):
-                    return index + 20, model_id
-
-            return 100, model_id
-
-        candidates.sort(key=sort_key)
-
-        st.session_state[data_key] = candidates
-        st.session_state[error_key] = ""
-        return candidates, ""
-
-    except Exception as error:
-        message = redact_secrets(f"{type(error).__name__}: {error}")
-        st.session_state[data_key] = []
-        st.session_state[error_key] = message
-        return [], message
-
-
-def friendly_api_error(error: Exception, model: str) -> str:
-    text = redact_secrets(str(error))
-    lower = text.lower()
-
-    if "model_not_found" in lower or "does not exist" in lower:
-        return (
-            f"ไม่พบโมเดล '{model}' หรือ API Key ไม่มีสิทธิ์ใช้งาน "
-            "กรุณารีเฟรชรายการโมเดลแล้วเลือกใหม่"
-        )
-
-    if "invalid_api_key" in lower or "incorrect api key" in lower:
-        return "API Key ไม่ถูกต้อง ถูกยกเลิก หรือหมดอายุ"
-
-    if "insufficient_quota" in lower or "billing" in lower:
-        return "บัญชี API ไม่มีโควตา หรือยังไม่ได้ตั้งค่า Billing"
-
-    if "image" in lower and (
-        "unsupported" in lower or "not support" in lower
-    ):
-        return (
-            f"โมเดล '{model}' ไม่รองรับ Image Input "
-            "กรุณาเลือกโมเดลที่รองรับการวิเคราะห์ภาพ"
-        )
-
-    return f"{type(error).__name__}: {text}"
-
-
-# =========================================================
-# 6) IMAGE HELPERS
-# =========================================================
-def validate_image(
-    data: bytes,
-    filename: str,
-) -> Tuple[bool, Optional[str], Dict[str, Any]]:
-    extension = original_extension(filename)
-
-    if extension not in SUPPORTED_EXTENSIONS:
-        return False, f"ไม่รองรับไฟล์ {extension or 'ไม่ทราบชนิด'}", {}
-
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            image.verify()
-
-        with Image.open(io.BytesIO(data)) as image:
-            image_format = (image.format or "").upper()
-            expected_format = {
-                ".jpg": "JPEG",
-                ".jpeg": "JPEG",
-                ".png": "PNG",
-            }[extension]
-
-            if image_format != expected_format:
-                return (
-                    False,
-                    f"นามสกุลเป็น {extension} แต่ข้อมูลภายในเป็น "
-                    f"{image_format or 'unknown'}",
-                    {},
-                )
-
-            has_transparency = (
-                image.mode in ("RGBA", "LA")
-                or (
-                    image.mode == "P"
-                    and "transparency" in image.info
-                )
-            )
-
-            return True, None, {
-                "width": image.width,
-                "height": image.height,
-                "mode": image.mode,
-                "format": image_format,
-                "has_transparency": has_transparency,
-            }
-
-    except UnidentifiedImageError:
-        return False, "ไฟล์นี้ไม่ใช่ภาพที่รองรับ", {}
-    except Exception as error:
-        return False, redact_secrets(f"เปิดไฟล์ไม่ได้: {error}"), {}
-
-
-def prepare_uploads(uploaded_files: List[Any]) -> List[Dict[str, Any]]:
-    payloads: List[Dict[str, Any]] = []
-    seen_ids = set()
-
-    for uploaded_file in uploaded_files:
-        data = uploaded_file.getvalue()
-        file_id = unique_file_id(uploaded_file.name, data)
-
-        if file_id in seen_ids:
-            continue
-
-        seen_ids.add(file_id)
-        valid, validation_error, image_info = validate_image(
-            data,
-            uploaded_file.name,
-        )
-
-        cache_path = ""
-        if valid:
-            cache_path = str(
-                cache_upload_on_server(
-                    file_id,
-                    uploaded_file.name,
-                    data,
-                )
-            )
-
-        payloads.append({
-            "id": file_id,
-            "original_name": uploaded_file.name,
-            "safe_name": sanitize_filename(uploaded_file.name),
-            "extension": original_extension(uploaded_file.name),
-            "bytes": data,
-            "size": len(data),
-            "mime": getattr(uploaded_file, "type", ""),
-            "valid": valid,
-            "validation_error": validation_error,
-            "image_info": image_info,
-            "server_cache_path": cache_path,
-        })
-
-    return payloads
-
-
-def optimize_for_analysis(data: bytes) -> bytes:
-    """
-    ย่อเฉพาะสำเนาที่ส่ง AI
-    ไฟล์ต้นฉบับสำหรับ Export ไม่ถูก resize
-    """
-    with Image.open(io.BytesIO(data)) as source:
-        image = ImageOps.exif_transpose(source)
-
-        if image.mode in ("RGBA", "LA"):
-            rgba = image.convert("RGBA")
-            background = Image.new(
-                "RGBA",
-                rgba.size,
-                (255, 255, 255, 255),
-            )
-            background.alpha_composite(rgba)
-            image = background.convert("RGB")
-
-        elif image.mode == "P" and "transparency" in image.info:
-            rgba = image.convert("RGBA")
-            background = Image.new(
-                "RGBA",
-                rgba.size,
-                (255, 255, 255, 255),
-            )
-            background.alpha_composite(rgba)
-            image = background.convert("RGB")
-
-        elif image.mode != "RGB":
-            image = image.convert("RGB")
-
-        image.thumbnail(
-            (ANALYSIS_MAX_SIDE, ANALYSIS_MAX_SIDE),
-            Image.Resampling.LANCZOS,
-        )
-
-        buffer = io.BytesIO()
-        image.save(
-            buffer,
-            format="JPEG",
-            quality=ANALYSIS_JPEG_QUALITY,
-            optimize=True,
-            subsampling=0,
-        )
-        return buffer.getvalue()
-
-
-# =========================================================
-# 7) KEYWORD / TITLE VALIDATION
-# =========================================================
-def split_keywords(raw: Any) -> List[str]:
-    if isinstance(raw, list):
-        return [
-            normalize_spaces(item)
-            for item in raw
-            if normalize_spaces(item)
-        ]
-
-    if isinstance(raw, str):
-        return [
-            normalize_spaces(item)
-            for item in raw.replace("\n", ",").split(",")
-            if normalize_spaces(item)
-        ]
-
-    return []
-
-
-def contains_blacklist_term(
-    text: str,
-    blacklist: List[str],
-) -> bool:
-    normalized_text = f" {re.sub(r'[^a-z0-9 ]+', ' ', text.lower())} "
-
-    for blocked in blacklist:
-        normalized_blocked = re.sub(
-            r"[^a-z0-9 ]+",
-            " ",
-            blocked.lower(),
-        ).strip()
-
-        if normalized_blocked and (
-            f" {normalized_blocked} " in normalized_text
-        ):
-            return True
-
+def has_transparency(image: Image.Image) -> bool:
+    if image.mode in {"RGBA", "LA"}:
+        return True
+    if image.mode == "P" and "transparency" in image.info:
+        return True
     return False
 
 
-def normalize_keywords(
-    raw: Any,
-    blacklist: List[str],
-    limit: int = KEYWORD_LIMIT,
-) -> str:
-    cleaned: List[str] = []
-    seen = set()
-
-    for keyword in split_keywords(raw):
-        keyword = keyword.strip(" ,;:.")
-        key = keyword.lower()
-
-        if not keyword or key in seen:
-            continue
-        if contains_blacklist_term(keyword, blacklist):
-            continue
-        if len(keyword) > 80:
-            continue
-        if any(character in keyword for character in "#@\\|{}[]<>"):
-            continue
-
-        seen.add(key)
-        cleaned.append(keyword)
-
-        if len(cleaned) >= limit:
-            break
-
-    return ", ".join(cleaned)
-
-
-def keyword_list(keywords: str) -> List[str]:
-    return [
-        normalize_spaces(item)
-        for item in keywords.split(",")
-        if normalize_spaces(item)
-    ]
-
-
-def keyword_count(keywords: str) -> int:
-    return len(keyword_list(keywords))
-
-
-def canonical_search_text(text: str) -> str:
-    return re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        text.lower(),
-    ).strip()
-
-
-def keyword_exactly_in_title(keyword: str, title: str) -> bool:
-    """
-    ตรวจ keyword แบบ exact phrase โดยไม่สนตัวพิมพ์ใหญ่เล็ก
-    และยอมให้ punctuation คั่นคำได้
-    """
-    keyword_normalized = canonical_search_text(keyword)
-    title_normalized = canonical_search_text(title)
-
-    if not keyword_normalized or not title_normalized:
-        return False
-
-    return (
-        f" {keyword_normalized} "
-        in f" {title_normalized} "
-    )
-
-
-def top_keyword_coverage(
-    title: str,
-    keywords: str,
-) -> Dict[str, Any]:
-    top_ten = keyword_list(keywords)[:TOP_KEYWORD_COUNT]
-    found = [
-        keyword
-        for keyword in top_ten
-        if keyword_exactly_in_title(keyword, title)
-    ]
-    missing = [
-        keyword
-        for keyword in top_ten
-        if keyword not in found
-    ]
-
-    return {
-        "top_ten": top_ten,
-        "found": found,
-        "missing": missing,
-        "count": len(found),
-        "complete": (
-            len(top_ten) == TOP_KEYWORD_COUNT
-            and len(found) == TOP_KEYWORD_COUNT
-        ),
-    }
-
-
-def duplicate_keywords(keywords: str) -> List[str]:
-    values = [
-        item.lower()
-        for item in keyword_list(keywords)
-    ]
-
-    return sorted({
-        item
-        for item in values
-        if values.count(item) > 1
-    })
-
-
-def deterministic_quality_check(
-    title: str,
-    keywords: str,
-    blacklist: List[str],
-    ai_review: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    คะแนนเต็ม 100:
-    - Keywords ครบ 49: 20
-    - Top 10 อยู่ใน Title ครบ: 35
-    - Title length: 10
-    - ไม่มี Keyword ซ้ำ: 10
-    - ไม่มี Blacklist: 10
-    - AI relevance/naturalness: 15
-    """
-    cleaned_title = normalize_title(title)
-    cleaned_keywords = normalize_keywords(
-        keywords,
-        blacklist=[],
-        limit=999,
-    )
-
-    count = keyword_count(cleaned_keywords)
-    duplicates = duplicate_keywords(cleaned_keywords)
-    coverage = top_keyword_coverage(
-        cleaned_title,
-        cleaned_keywords,
-    )
-
-    title_blacklisted = contains_blacklist_term(
-        cleaned_title,
-        blacklist,
-    )
-
-    blocked_keywords = [
-        keyword
-        for keyword in keyword_list(cleaned_keywords)
-        if contains_blacklist_term(keyword, blacklist)
-    ]
-
-    title_length_ok = (
-        TITLE_MIN_LENGTH
-        <= len(cleaned_title)
-        <= TITLE_MAX_LENGTH
-    )
-
-    score_breakdown = {
-        "keyword_count": 20 if count == KEYWORD_LIMIT else max(
-            0,
-            20 - abs(KEYWORD_LIMIT - count) * 2,
-        ),
-        "top_10_coverage": round(
-            35 * (coverage["count"] / TOP_KEYWORD_COUNT)
-        ) if coverage["top_ten"] else 0,
-        "title_length": 10 if title_length_ok else 0,
-        "no_duplicates": 10 if not duplicates else 0,
-        "no_blacklist": 10 if (
-            not title_blacklisted
-            and not blocked_keywords
-        ) else 0,
-        "ai_quality": 0,
-    }
-
-    ai_relevance = None
-    ai_naturalness = None
-    ai_accuracy = None
-    ai_notes: List[str] = []
-
-    if ai_review:
-        ai_relevance = int(ai_review.get("relevance_score", 0) or 0)
-        ai_naturalness = int(ai_review.get("naturalness_score", 0) or 0)
-        ai_accuracy = int(ai_review.get("keyword_accuracy_score", 0) or 0)
-        ai_notes = [
-            normalize_spaces(note)
-            for note in ai_review.get("notes", [])
-            if normalize_spaces(note)
-        ][:5]
-
-        average_ai = (
-            ai_relevance
-            + ai_naturalness
-            + ai_accuracy
-        ) / 3
-
-        score_breakdown["ai_quality"] = round(
-            15 * (average_ai / 10)
-        )
-
-    total_score = min(
-        100,
-        sum(score_breakdown.values()),
-    )
-
-    hard_requirements = {
-        "keywords_49": count == KEYWORD_LIMIT,
-        "top_10_complete": coverage["complete"],
-        "title_within_200": (
-            0 < len(cleaned_title) <= TITLE_MAX_LENGTH
-        ),
-        "no_duplicates": not duplicates,
-        "no_blacklist": (
-            not title_blacklisted
-            and not blocked_keywords
-        ),
-        "ai_relevance_pass": (
-            ai_relevance is None
-            or ai_relevance >= 7
-        ),
-        "ai_naturalness_pass": (
-            ai_naturalness is None
-            or ai_naturalness >= 7
-        ),
-        "ai_keyword_accuracy_pass": (
-            ai_accuracy is None
-            or ai_accuracy >= 7
-        ),
-    }
-
-    all_hard_pass = all(hard_requirements.values())
-
-    if all_hard_pass and total_score >= 90:
-        status = "ผ่าน — พร้อม Export"
-        level = "success"
-    elif (
-        coverage["complete"]
-        and count == KEYWORD_LIMIT
-        and total_score >= 75
-    ):
-        status = "ควรตรวจสอบเพิ่มเติม"
-        level = "warning"
-    else:
-        status = "ไม่ผ่าน — ควรแก้ก่อน Export"
-        level = "error"
-
-    issues: List[str] = []
-
-    if count != KEYWORD_LIMIT:
-        issues.append(
-            f"Keywords มี {count}/{KEYWORD_LIMIT} คำ"
-        )
-
-    if not coverage["complete"]:
-        issues.append(
-            "10 Keywords แรกยังอยู่ใน Title ไม่ครบ: "
-            + ", ".join(coverage["missing"])
-        )
-
-    if not title_length_ok:
-        issues.append(
-            f"Title ควรยาว {TITLE_MIN_LENGTH}–"
-            f"{TITLE_MAX_LENGTH} ตัวอักษร "
-            f"(ปัจจุบัน {len(cleaned_title)})"
-        )
-
-    if duplicates:
-        issues.append(
-            "มี Keyword ซ้ำ: "
-            + ", ".join(duplicates[:10])
-        )
-
-    if title_blacklisted or blocked_keywords:
-        issues.append(
-            "พบคำ Blacklist ใน Title หรือ Keywords"
-        )
-
-    if ai_relevance is not None and ai_relevance < 7:
-        issues.append("AI ประเมินว่า Metadata ยังไม่ตรงภาพพอ")
-
-    if ai_naturalness is not None and ai_naturalness < 7:
-        issues.append("AI ประเมินว่า Title ยังไม่เป็นธรรมชาติพอ")
-
-    if ai_accuracy is not None and ai_accuracy < 7:
-        issues.append("AI ประเมินว่า Keywords บางคำอาจไม่แม่นยำ")
-
-    return {
-        "score": total_score,
-        "status": status,
-        "level": level,
-        "score_breakdown": score_breakdown,
-        "hard_requirements": hard_requirements,
-        "issues": issues,
-        "keyword_count": count,
-        "duplicates": duplicates,
-        "blocked_keywords": blocked_keywords,
-        "title_length": len(cleaned_title),
-        "title_length_ok": title_length_ok,
-        "coverage": coverage,
-        "ai_relevance": ai_relevance,
-        "ai_naturalness": ai_naturalness,
-        "ai_keyword_accuracy": ai_accuracy,
-        "ai_notes": ai_notes,
-    }
-
-
-# =========================================================
-# 8) STRUCTURED OUTPUT SCHEMAS
-# =========================================================
-class StockMetadataSchema(BaseModel):
-    title: str = Field(min_length=1, max_length=200)
-    keywords: List[str] = Field(min_length=49, max_length=49)
-    quality_notes: List[str] = Field(default_factory=list, max_length=3)
-    risk_notes: List[str] = Field(default_factory=list, max_length=5)
-
-
-class TitleOnlySchema(BaseModel):
-    title: str = Field(min_length=1, max_length=200)
-
-
-class QualityReviewSchema(BaseModel):
-    relevance_score: int = Field(ge=0, le=10)
-    naturalness_score: int = Field(ge=0, le=10)
-    keyword_accuracy_score: int = Field(ge=0, le=10)
-    notes: List[str] = Field(default_factory=list, max_length=5)
-
-
-# =========================================================
-# 9) OPENAI STRUCTURED OUTPUT HELPERS
-# =========================================================
-def extract_json_fallback(raw_text: str) -> Dict[str, Any]:
-    """
-    Fallback only. Primary path uses client.responses.parse().
-    Handles plain JSON, Markdown fences, and JSON embedded in prose.
-    """
-    text = (raw_text or "").strip()
-
-    if not text:
-        raise ValueError("โมเดลส่งผลลัพธ์ว่าง")
-
-    text = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(r"\s*```$", "", text)
-
+def inspect_image(data: bytes) -> dict[str, Any]:
     try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(text):
-        if character != "{":
-            continue
-        try:
-            parsed, _ = decoder.raw_decode(text[index:])
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
-
-    raise ValueError(
-        "ไม่พบ JSON ที่ใช้งานได้ในผลลัพธ์ของโมเดล"
-    )
-
-
-def safe_response_text(response: Any) -> str:
-    return redact_secrets(
-        (getattr(response, "output_text", "") or "").strip()
-    )
-
-
-def parsed_response_or_raise(
-    response: Any,
-    schema_class: Any,
-) -> Any:
-    """Return output_parsed or validate a fallback JSON payload."""
-    parsed = getattr(response, "output_parsed", None)
-
-    if parsed is not None:
-        return parsed
-
-    raw_text = safe_response_text(response)
-
-    try:
-        fallback_data = extract_json_fallback(raw_text)
-        return schema_class.model_validate(fallback_data)
-    except Exception as error:
-        preview = raw_text[:2000] if raw_text else "<empty output>"
-        raise ValueError(
-            "Structured Output ไม่ถูกสร้างตาม Schema\n\n"
-            f"รายละเอียด: {error}\n\n"
-            f"Raw model output:\n{preview}"
-        ) from error
-
-
-def call_structured_openai(
-    client: OpenAI,
-    model: str,
-    input_payload: List[Dict[str, Any]],
-    schema_class: Any,
-    max_output_tokens: int,
-    retries: int = 3,
-) -> Tuple[Any, str]:
-    """
-    Primary: Responses API Structured Outputs via responses.parse().
-    Fallback: normal Responses API + strict JSON prompt parsing.
-    """
-    last_error: Optional[Exception] = None
-
-    for attempt in range(retries):
-        try:
-            parse_method = getattr(client.responses, "parse", None)
-
-            if callable(parse_method):
-                response = parse_method(
-                    model=model,
-                    input=input_payload,
-                    text_format=schema_class,
-                    max_output_tokens=max_output_tokens,
-                )
-                parsed = parsed_response_or_raise(
-                    response,
-                    schema_class,
-                )
-                return parsed, safe_response_text(response)
-
-            # Compatibility fallback for older SDKs.
-            response = client.responses.create(
-                model=model,
-                input=input_payload,
-                max_output_tokens=max_output_tokens,
-            )
-            parsed = parsed_response_or_raise(
-                response,
-                schema_class,
-            )
-            return parsed, safe_response_text(response)
-
-        except Exception as error:
-            last_error = error
-
-            if attempt < retries - 1:
-                time.sleep(1.5 * (2**attempt))
-
-    raise last_error or RuntimeError(
-        "OpenAI Structured Output request failed"
-    )
-
-
-def image_data_url(data: bytes) -> str:
-    optimized = optimize_for_analysis(data)
-    encoded = base64.b64encode(optimized).decode("utf-8")
-    return f"data:image/jpeg;base64,{encoded}"
-
-
-# =========================================================
-# 10) PROMPTS
-# =========================================================
-def metadata_prompt(
-    category_name: str,
-    category_num: int,
-    hint: str,
-    blacklist: List[str],
-) -> str:
-    return f"""
-You are a senior Adobe Stock metadata editor.
-
-Analyze the uploaded image accurately and create searchable metadata.
-
-SELECTED CATEGORY
-- {category_name}
-- Category ID: {category_num}
-
-OPTIONAL USER CONTEXT
-{hint.strip() if hint.strip() else "None"}
-
-FORBIDDEN TERMS
-{", ".join(blacklist) if blacklist else "None"}
-
-MANDATORY WORKFLOW
-
-1. Create exactly 49 unique English keywords in descending importance.
-2. The first 10 keywords must be the strongest buyer search terms.
-3. Keep each of the first 10 concise enough to fit naturally in one title.
-4. The first 10 must cover different useful aspects rather than repeat synonyms.
-5. After finalizing all keywords, write one English title.
-6. Every one of the first 10 keywords must appear verbatim in the title,
-   ignoring capitalization and punctuation.
-7. The title must still be grammatical, natural, clear, and human-written.
-
-TITLE RULES
-- Maximum 200 characters.
-- Prefer 100–200 characters when natural.
-- Put the main subject and action early.
-- Do not output a raw keyword list.
-- Avoid excessive commas and unnatural repetition.
-- Do not begin with “Image of”, “Photo of”, or “Picture of”.
-- Do not invent unsupported details.
-- Do not use brands, trademarks, logos, celebrity names,
-  copyrighted characters, or forbidden terms.
-
-KEYWORD RULES
-- Exactly 49 unique English keywords.
-- Most important first.
-- Relevant to visible content and useful buyer intent.
-- No irrelevant filler or unnecessary singular/plural duplication.
-- No brands, trademarks, copyrighted names, or celebrity names.
-
-Before finalizing, verify internally that:
-- keyword count is exactly 49
-- first-10 title coverage is 10/10
-- title length is at most 200 characters
-""".strip()
-
-
-def title_repair_prompt(
-    keywords: str,
-    current_title: str,
-    missing_keywords: List[str],
-    hint: str,
-) -> str:
-    top_ten = keyword_list(keywords)[:TOP_KEYWORD_COUNT]
-
-    return f"""
-You are a senior Adobe Stock title editor.
-
-TOP 10 KEYWORDS — each phrase must appear verbatim in the new title:
-{", ".join(top_ten)}
-
-CURRENTLY MISSING:
-{", ".join(missing_keywords) if missing_keywords else "None"}
-
-CURRENT TITLE:
-{current_title or "None"}
-
-OPTIONAL CONTEXT:
-{hint.strip() if hint.strip() else "None"}
-
-Write one improved English stock title.
-
-Mandatory requirements:
-- Include all 10 supplied keywords verbatim.
-- Maximum 200 characters.
-- Natural, grammatical, readable, and human-written.
-- Not a raw keyword list.
-- Main subject and action should appear early.
-- Do not invent unsupported details.
-- Avoid excessive commas and awkward repetition.
-""".strip()
-
-
-def quality_review_prompt(
-    title: str,
-    keywords: str,
-) -> str:
-    return f"""
-You are a strict Adobe Stock metadata quality reviewer.
-
-Review this metadata against the uploaded image.
-
-TITLE
-{title}
-
-KEYWORDS
-{keywords}
-
-Score each criterion from 0 to 10 using integers:
-- relevance_score: title accuracy against visible image content
-- naturalness_score: title clarity, grammar, and natural readability
-- keyword_accuracy_score: keyword relevance and lack of misleading concepts
-
-Be strict. Unsupported concepts must lower the score.
-Return no more than 5 short actionable notes.
-""".strip()
-
-
-# =========================================================
-# 11) AI OPERATIONS
-# =========================================================
-def repair_title_once(
-    client: OpenAI,
-    model: str,
-    keywords: str,
-    current_title: str,
-    hint: str,
-) -> Tuple[str, str]:
-    coverage = top_keyword_coverage(
-        current_title,
-        keywords,
-    )
-
-    parsed, raw = call_structured_openai(
-        client=client,
-        model=model,
-        input_payload=[{
-            "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": title_repair_prompt(
-                    keywords=keywords,
-                    current_title=current_title,
-                    missing_keywords=coverage["missing"],
-                    hint=hint,
-                ),
-            }],
-        }],
-        schema_class=TitleOnlySchema,
-        max_output_tokens=450,
-        retries=2,
-    )
-
-    return normalize_title(parsed.title), raw
-
-
-def generate_metadata(
-    image_bytes: bytes,
-    api_key: str,
-    model: str,
-    category_name: str,
-    category_num: int,
-    hint: str,
-    blacklist: List[str],
-) -> Dict[str, Any]:
-    try:
-        client = OpenAI(api_key=api_key)
-
-        parsed, raw = call_structured_openai(
-            client=client,
-            model=model,
-            input_payload=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": metadata_prompt(
-                            category_name,
-                            category_num,
-                            hint,
-                            blacklist,
-                        ),
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_data_url(image_bytes),
-                        "detail": "high",
-                    },
-                ],
-            }],
-            schema_class=StockMetadataSchema,
-            max_output_tokens=1800,
-            retries=3,
-        )
-
-        title = normalize_title(parsed.title)
-        keywords = normalize_keywords(
-            parsed.keywords,
-            blacklist,
-            limit=KEYWORD_LIMIT,
-        )
-
-        if keyword_count(keywords) != KEYWORD_LIMIT:
-            raise ValueError(
-                "Structured Output ผ่าน Schema แต่ Keywords หลังการกรอง "
-                f"เหลือ {keyword_count(keywords)}/{KEYWORD_LIMIT} คำ "
-                "อาจเกิดจากคำซ้ำหรือคำ Blacklist"
-            )
-
-        repair_history: List[Dict[str, Any]] = []
-
-        for attempt in range(1, MAX_TITLE_REPAIR_ATTEMPTS + 1):
-            coverage = top_keyword_coverage(title, keywords)
-
-            if coverage["complete"] and len(title) <= TITLE_MAX_LENGTH:
-                break
-
-            previous_title = title
-            title, repair_raw = repair_title_once(
-                client=client,
-                model=model,
-                keywords=keywords,
-                current_title=title,
-                hint=hint,
-            )
-
-            repair_history.append({
-                "attempt": attempt,
-                "missing_before": coverage["missing"],
-                "previous_title": previous_title,
-                "new_title": title,
-                "raw": repair_raw,
-            })
-
-        final_coverage = top_keyword_coverage(
-            title,
-            keywords,
-        )
-
-        return {
-            "title": title,
-            "keywords": keywords,
-            "quality_notes": [
-                normalize_spaces(note)
-                for note in parsed.quality_notes[:3]
-                if normalize_spaces(note)
-            ],
-            "risk_notes": [
-                normalize_spaces(note)
-                for note in parsed.risk_notes[:5]
-                if normalize_spaces(note)
-            ],
-            "repair_history": repair_history,
-            "structured_output": True,
-            "top_10_complete": final_coverage["complete"],
-            "raw": raw,
-            "error": False,
-            "error_message": "",
-        }
-
-    except Exception as error:
-        message = friendly_api_error(error, model)
-
-        return {
-            "title": "",
-            "keywords": "",
-            "quality_notes": [],
-            "risk_notes": [],
-            "repair_history": [],
-            "structured_output": False,
-            "top_10_complete": False,
-            "raw": redact_secrets(str(error)),
-            "error": True,
-            "error_message": message,
-        }
-
-
-def regenerate_title_until_valid(
-    keywords: str,
-    current_title: str,
-    api_key: str,
-    model: str,
-    hint: str,
-) -> Dict[str, Any]:
-    if keyword_count(keywords) < TOP_KEYWORD_COUNT:
-        return {
-            "title": current_title,
-            "attempts": 0,
-            "coverage": top_keyword_coverage(
-                current_title,
-                keywords,
-            ),
-            "error": True,
-            "error_message": "ต้องมีอย่างน้อย 10 Keywords ก่อน",
-        }
-
-    try:
-        client = OpenAI(api_key=api_key)
-        title = normalize_title(current_title)
-        attempts = 0
-        raw_outputs: List[str] = []
-
-        for attempt in range(1, MAX_TITLE_REPAIR_ATTEMPTS + 1):
-            title, raw = repair_title_once(
-                client=client,
-                model=model,
-                keywords=keywords,
-                current_title=title,
-                hint=hint,
-            )
-            raw_outputs.append(raw)
-            attempts = attempt
-
-            coverage = top_keyword_coverage(
-                title,
-                keywords,
-            )
-
-            if coverage["complete"] and len(title) <= TITLE_MAX_LENGTH:
-                break
-
-        final_coverage = top_keyword_coverage(
-            title,
-            keywords,
-        )
-
-        return {
-            "title": title,
-            "attempts": attempts,
-            "coverage": final_coverage,
-            "raw_outputs": raw_outputs,
-            "error": False,
-            "error_message": "",
-        }
-
-    except Exception as error:
-        return {
-            "title": current_title,
-            "attempts": 0,
-            "coverage": top_keyword_coverage(
-                current_title,
-                keywords,
-            ),
-            "raw_outputs": [],
-            "error": True,
-            "error_message": friendly_api_error(error, model),
-        }
-
-
-def ai_quality_review(
-    image_bytes: bytes,
-    title: str,
-    keywords: str,
-    api_key: str,
-    model: str,
-) -> Dict[str, Any]:
-    try:
-        client = OpenAI(api_key=api_key)
-
-        parsed, raw = call_structured_openai(
-            client=client,
-            model=model,
-            input_payload=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": quality_review_prompt(
-                            title,
-                            keywords,
-                        ),
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_data_url(image_bytes),
-                        "detail": "high",
-                    },
-                ],
-            }],
-            schema_class=QualityReviewSchema,
-            max_output_tokens=500,
-            retries=3,
-        )
-
-        return {
-            "relevance_score": parsed.relevance_score,
-            "naturalness_score": parsed.naturalness_score,
-            "keyword_accuracy_score": parsed.keyword_accuracy_score,
-            "notes": [
-                normalize_spaces(note)
-                for note in parsed.notes[:5]
-                if normalize_spaces(note)
-            ],
-            "raw": raw,
-            "error": False,
-            "error_message": "",
-        }
-
-    except Exception as error:
-        return {
-            "relevance_score": 0,
-            "naturalness_score": 0,
-            "keyword_accuracy_score": 0,
-            "notes": [],
-            "raw": redact_secrets(str(error)),
-            "error": True,
-            "error_message": friendly_api_error(error, model),
-        }
-
-
-# =========================================================
-# 11) EXPORT HELPERS
-# =========================================================
-def export_jpeg(
-    data: bytes,
-    title: str,
-    keywords: str,
-    extension: str,
-) -> bytes:
-    temp_path: Optional[str] = None
-
-    try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".jpeg" if extension == ".jpeg" else ".jpg",
-            delete=False,
-        ) as temporary_file:
-            temporary_file.write(data)
-            temp_path = temporary_file.name
-
-        info = IPTCInfo(temp_path, force=True)
-        info["object name"] = title.encode("utf-8")
-        info["caption/abstract"] = title.encode("utf-8")
-        info["keywords"] = [
-            keyword.encode("utf-8")
-            for keyword in keyword_list(keywords)
-        ]
-        info.save()
-
-        return Path(temp_path).read_bytes()
-
-    except Exception:
-        return data
-
-    finally:
-        if temp_path:
-            for path in (
-                Path(temp_path),
-                Path(temp_path + "~"),
-            ):
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
-
-def export_png(
-    data: bytes,
-    title: str,
-    keywords: str,
-) -> bytes:
-    try:
-        with Image.open(io.BytesIO(data)) as source:
-            source.load()
-            original_size = source.size
-            original_has_alpha = (
-                source.mode in ("RGBA", "LA")
-                or (
-                    source.mode == "P"
-                    and "transparency" in source.info
-                )
-            )
-
-            metadata = PngInfo()
-
-            for key, value in source.info.items():
-                if (
-                    isinstance(value, str)
-                    and key.lower()
-                    not in {
-                        "title",
-                        "description",
-                        "caption",
-                        "keywords",
-                    }
-                ):
-                    try:
-                        metadata.add_text(key, value)
-                    except Exception:
-                        pass
-
-            metadata.add_text("Title", title)
-            metadata.add_text("Description", title)
-            metadata.add_text("Keywords", keywords)
-
-            save_options: Dict[str, Any] = {
-                "format": "PNG",
-                "pnginfo": metadata,
-                "compress_level": 6,
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            return {
+                "width": int(image.width),
+                "height": int(image.height),
+                "mode": str(image.mode),
+                "format": str(image.format or ""),
+                "transparency": has_transparency(image),
+                "dpi": image.info.get("dpi"),
+                "has_icc_profile": bool(image.info.get("icc_profile")),
             }
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError("ไม่สามารถอ่านไฟล์ภาพนี้ได้ หรือไฟล์อาจเสียหาย") from exc
 
-            if source.info.get("icc_profile"):
-                save_options["icc_profile"] = (
-                    source.info["icc_profile"]
-                )
 
-            if source.info.get("dpi"):
-                save_options["dpi"] = source.info["dpi"]
+def create_analysis_data_url(
+    original_bytes: bytes,
+    max_long_edge: int = ANALYSIS_MAX_LONG_EDGE,
+) -> tuple[str, dict[str, Any]]:
+    """Create a resized analysis copy. The returned bytes are never used for export."""
+    try:
+        with Image.open(io.BytesIO(original_bytes)) as source:
+            source.load()
+            source = ImageOps.exif_transpose(source)
+            alpha = has_transparency(source)
 
-            if (
-                source.mode in ("P", "L", "RGB")
-                and "transparency" in source.info
-            ):
-                save_options["transparency"] = (
-                    source.info["transparency"]
-                )
+            if alpha:
+                working = source.convert("RGBA")
+                output_format = "PNG"
+                media_type = "image/png"
+            else:
+                working = source.convert("RGB")
+                output_format = "JPEG"
+                media_type = "image/jpeg"
+
+            original_size = working.size
+            working.thumbnail((max_long_edge, max_long_edge), Image.Resampling.LANCZOS)
 
             output = io.BytesIO()
-            source.save(output, **save_options)
-            exported = output.getvalue()
-
-        with Image.open(io.BytesIO(exported)) as check:
-            exported_has_alpha = (
-                check.mode in ("RGBA", "LA")
-                or (
-                    check.mode == "P"
-                    and "transparency" in check.info
+            if output_format == "PNG":
+                working.save(output, format="PNG", optimize=True)
+            else:
+                working.save(
+                    output,
+                    format="JPEG",
+                    quality=88,
+                    optimize=True,
+                    progressive=True,
                 )
-            )
 
-            if check.size != original_size:
-                raise ValueError("PNG dimensions changed")
+            encoded = base64.b64encode(output.getvalue()).decode("ascii")
+            data_url = f"data:{media_type};base64,{encoded}"
+            info = {
+                "analysis_width": working.width,
+                "analysis_height": working.height,
+                "analysis_format": output_format,
+                "original_width": original_size[0],
+                "original_height": original_size[1],
+            }
+            return data_url, info
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError("สร้างสำเนาภาพสำหรับวิเคราะห์ไม่สำเร็จ") from exc
 
-            if original_has_alpha and not exported_has_alpha:
-                raise ValueError("PNG transparency was lost")
+# ========================================================================================
+# Inlined from: core/quality.py
+# ========================================================================================
 
-        return exported
+import re
+from collections import Counter
+from typing import Any, Iterable
 
-    except Exception:
-        return data
+FORBIDDEN_TITLE_PREFIXES = ("image of", "photo of", "picture of")
+CONNECTOR_WORDS = {
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "with",
+    "in",
+    "on",
+    "at",
+    "by",
+    "for",
+    "from",
+    "to",
+    "of",
+    "during",
+    "before",
+    "after",
+    "while",
+    "under",
+    "over",
+    "near",
+    "through",
+    "into",
+    "using",
+    "showing",
+    "featuring",
+}
 
 
-def export_image(
-    data: bytes,
-    extension: str,
+def normalize_phrase(value: str) -> str:
+    value = value.casefold().strip()
+    value = value.replace("&", " and ")
+    value = re.sub(r"[-_/]+", " ", value)
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def keyword_in_title(keyword: str, title: str) -> bool:
+    keyword_norm = normalize_phrase(keyword)
+    title_norm = normalize_phrase(title)
+    if not keyword_norm or not title_norm:
+        return False
+    pattern = rf"(?<![a-z0-9]){re.escape(keyword_norm)}(?![a-z0-9])"
+    return re.search(pattern, title_norm) is not None
+
+
+def parse_keywords(value: str | Iterable[str] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r"[,;\n|]+", value)
+    else:
+        raw_items = [str(item) for item in value]
+
+    cleaned: list[str] = []
+    for item in raw_items:
+        item = re.sub(r"^\s*\d+[\.)-]?\s*", "", item)
+        item = item.strip().strip('"\'`[]{}()')
+        item = re.sub(r"\s+", " ", item)
+        if item:
+            cleaned.append(item)
+    return cleaned
+
+
+def find_duplicates(keywords: list[str]) -> list[str]:
+    normalized = [normalize_phrase(keyword) for keyword in keywords]
+    counts = Counter(item for item in normalized if item)
+    duplicates: list[str] = []
+    seen: set[str] = set()
+    for original, normalized_value in zip(keywords, normalized):
+        if counts[normalized_value] > 1 and normalized_value not in seen:
+            duplicates.append(original)
+            seen.add(normalized_value)
+    return duplicates
+
+
+def find_blacklist_hits(keywords: list[str], blacklist: Iterable[str]) -> list[str]:
+    blacklist_norm = {normalize_phrase(item) for item in blacklist if normalize_phrase(item)}
+    hits: list[str] = []
+    for keyword in keywords:
+        normalized = normalize_phrase(keyword)
+        if normalized in blacklist_norm:
+            hits.append(keyword)
+    return hits
+
+
+def top_keyword_coverage(title: str, keywords: list[str], top_n: int = 10) -> dict[str, Any]:
+    top = keywords[:top_n]
+    present = [keyword for keyword in top if keyword_in_title(keyword, title)]
+    missing = [keyword for keyword in top if not keyword_in_title(keyword, title)]
+    return {
+        "count": len(present),
+        "total": len(top),
+        "present": present,
+        "missing": missing,
+    }
+
+
+def looks_like_keyword_dump(title: str) -> bool:
+    words = normalize_phrase(title).split()
+    if len(words) < 8:
+        return False
+    connector_count = sum(word in CONNECTOR_WORDS for word in words)
+    comma_count = title.count(",")
+    return comma_count >= 6 or (len(words) >= 14 and connector_count <= 2)
+
+
+def ai_average(ai_review: dict[str, Any] | None) -> float | None:
+    if not ai_review:
+        return None
+    values: list[float] = []
+    for key in ("relevance_score", "naturalness_score", "keyword_accuracy_score"):
+        try:
+            values.append(float(ai_review[key]))
+        except (KeyError, TypeError, ValueError):
+            return None
+    return sum(values) / len(values)
+
+
+def evaluate_quality(
     title: str,
-    keywords: str,
-) -> bytes:
-    if extension in {".jpg", ".jpeg"}:
-        return export_jpeg(
-            data,
-            title,
-            keywords,
-            extension,
-        )
+    keywords: list[str],
+    blacklist: Iterable[str],
+    ai_review: dict[str, Any] | None = None,
+    ai_threshold: int = 75,
+) -> dict[str, Any]:
+    title = (title or "").strip()
+    keywords = parse_keywords(keywords)
+    duplicate_keywords = find_duplicates(keywords)
+    blacklist_hits = find_blacklist_hits(keywords, blacklist)
+    coverage = top_keyword_coverage(title, keywords, top_n=10)
+    title_length = len(title)
+    comma_count = title.count(",")
+    prefix_bad = normalize_phrase(title).startswith(FORBIDDEN_TITLE_PREFIXES)
+    keyword_dump = looks_like_keyword_dump(title)
 
-    if extension == ".png":
-        return export_png(
-            data,
-            title,
-            keywords,
-        )
+    issues: list[str] = []
+    warnings: list[str] = []
 
-    return data
+    if len(keywords) != 49:
+        issues.append(f"Keywords มี {len(keywords)} คำ ต้องเป็น 49 คำ")
+    if duplicate_keywords:
+        issues.append("พบ Keyword ซ้ำ: " + ", ".join(duplicate_keywords))
+    if blacklist_hits:
+        issues.append("พบคำ Blacklist: " + ", ".join(blacklist_hits))
+    if not title:
+        issues.append("Title ว่าง")
+    if title_length > 200:
+        issues.append(f"Title ยาว {title_length} ตัวอักษร เกิน 200")
+    if coverage["count"] != 10 or coverage["total"] != 10:
+        missing = ", ".join(coverage["missing"]) or "Top 10 ยังไม่ครบ"
+        issues.append(f"Top 10 Keyword Coverage ไม่ครบ: {missing}")
+    if prefix_bad:
+        issues.append("Title ขึ้นต้นด้วย Image of / Photo of / Picture of")
+    if comma_count > 5:
+        warnings.append("Title มี comma มากเกินไป")
+    if keyword_dump:
+        warnings.append("Title มีลักษณะคล้าย Keyword Dump")
 
+    keyword_score = 20 if len(keywords) == 49 else round(20 * min(len(keywords), 49) / 49, 2)
+    coverage_score = round(35 * min(coverage["count"], 10) / 10, 2)
+    title_score = 10 if title and title_length <= 200 else 0
+    duplicate_score = 10 if not duplicate_keywords else 0
+    blacklist_score = 10 if not blacklist_hits else 0
 
-# =========================================================
-# 12) SIDEBAR
-# =========================================================
-with st.sidebar:
-    st.header("⚙️ Settings")
-
-    manual_api_key = st.text_input(
-        "🔑 OpenAI API Key",
-        value="",
-        type="password",
-        placeholder=(
-            "ไม่ต้องกรอก หากตั้ง OPENAI_API_KEY แล้ว"
-        ),
+    average = ai_average(ai_review)
+    ai_score = round(15 * average / 100, 2) if average is not None else 0
+    score = round(
+        keyword_score
+        + coverage_score
+        + title_score
+        + duplicate_score
+        + blacklist_score
+        + ai_score,
+        2,
     )
 
-    env_api_key = os.getenv(
-        "OPENAI_API_KEY",
-        "",
-    ).strip()
+    hard_pass = (
+        len(keywords) == 49
+        and coverage["count"] == 10
+        and coverage["total"] == 10
+        and bool(title)
+        and title_length <= 200
+        and not duplicate_keywords
+        and not blacklist_hits
+        and not prefix_bad
+    )
+    ai_pass = average is None or average >= ai_threshold
+    export_eligible = hard_pass and ai_pass
+
+    if not hard_pass or not ai_pass:
+        status = "ไม่ผ่าน — ควรแก้ก่อน Export"
+    elif average is None:
+        status = "ควรตรวจสอบเพิ่มเติม — ยังไม่ได้ AI Review"
+    elif score >= 90:
+        status = "ผ่าน — พร้อม Export"
+    else:
+        status = "ควรตรวจสอบเพิ่มเติม"
+
+    if average is not None and average < ai_threshold:
+        issues.append(f"AI Review เฉลี่ย {average:.0f} ต่ำกว่าเกณฑ์ {ai_threshold}")
+
+    return {
+        "score": score,
+        "status": status,
+        "hard_pass": hard_pass,
+        "ai_pass": ai_pass,
+        "export_eligible": export_eligible,
+        "keyword_count": len(keywords),
+        "title_length": title_length,
+        "top10_coverage": coverage["count"],
+        "top10_total": coverage["total"],
+        "missing_keywords": coverage["missing"],
+        "duplicate_keywords": duplicate_keywords,
+        "blacklist_hits": blacklist_hits,
+        "comma_count": comma_count,
+        "keyword_dump": keyword_dump,
+        "ai_average": average,
+        "issues": issues,
+        "warnings": warnings,
+        "score_breakdown": {
+            "keyword_count": keyword_score,
+            "top10_coverage": coverage_score,
+            "title_length": title_score,
+            "duplicates": duplicate_score,
+            "blacklist": blacklist_score,
+            "ai_review": ai_score,
+        },
+    }
+
+# ========================================================================================
+# Inlined from: core/costs.py
+# ========================================================================================
+
+from collections import defaultdict
+from typing import Any, Iterable
+
+# Prices are USD per 1 million tokens. Keep this table explicit and reviewable.
+# Updated from official OpenAI model pages on 2026-07-11.
+MODEL_PRICING_USD_PER_MTOK: dict[str, dict[str, float]] = {
+    # USD per 1M tokens. Verify periodically against official OpenAI pricing.
+    "gpt-5.6": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.5": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
+    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
+    "gpt-5.4-nano": {"input": 0.20, "cached_input": 0.02, "output": 1.25},
+    "gpt-4.1": {"input": 2.00, "cached_input": 0.50, "output": 8.00},
+    "gpt-4.1-mini": {"input": 0.40, "cached_input": 0.10, "output": 1.60},
+    "gpt-4.1-nano": {"input": 0.10, "cached_input": 0.025, "output": 0.40},
+    "gpt-4o": {"input": 2.50, "cached_input": 1.25, "output": 10.00},
+    "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
+}
+PRICING_UPDATED_AT = "2026-07-11"
+
+
+def get_attr(obj: Any, name: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def safe_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def resolve_pricing_key(model_id: str) -> str | None:
+    """Resolve stable aliases and dated snapshots without guessing unknown families."""
+    model = str(model_id or "").strip().casefold()
+    if not model:
+        return None
+    for key in sorted(MODEL_PRICING_USD_PER_MTOK, key=len, reverse=True):
+        if model == key or model.startswith(key + "-"):
+            return key
+    return None
+
+
+def extract_response_usage(response: Any) -> dict[str, int]:
+    """Read Responses API usage across SDK objects and plain dictionaries."""
+    usage = get_attr(response, "usage", None) or {}
+    input_details = (
+        get_attr(usage, "input_tokens_details", None)
+        or get_attr(usage, "prompt_tokens_details", None)
+        or {}
+    )
+    output_details = get_attr(usage, "output_tokens_details", None) or {}
+
+    input_tokens = safe_int(
+        get_attr(usage, "input_tokens", None)
+        or get_attr(usage, "prompt_tokens", None)
+    )
+    output_tokens = safe_int(
+        get_attr(usage, "output_tokens", None)
+        or get_attr(usage, "completion_tokens", None)
+    )
+    cached_input_tokens = min(
+        input_tokens,
+        safe_int(get_attr(input_details, "cached_tokens", 0)),
+    )
+    reasoning_tokens = safe_int(get_attr(output_details, "reasoning_tokens", 0))
+    total_tokens = safe_int(get_attr(usage, "total_tokens", 0))
+    if total_tokens == 0:
+        total_tokens = input_tokens + output_tokens
+
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "non_cached_input_tokens": max(0, input_tokens - cached_input_tokens),
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def calculate_usage_cost(model_id: str, usage: dict[str, int]) -> dict[str, Any]:
+    pricing_key = resolve_pricing_key(model_id)
+    if pricing_key is None:
+        return {
+            "pricing_available": False,
+            "pricing_key": None,
+            "pricing_updated_at": PRICING_UPDATED_AT,
+            "input_cost_usd": None,
+            "cached_input_cost_usd": None,
+            "output_cost_usd": None,
+            "total_cost_usd": None,
+        }
+
+    price = MODEL_PRICING_USD_PER_MTOK[pricing_key]
+    input_cost = usage["non_cached_input_tokens"] * price["input"] / 1_000_000
+    cached_cost = usage["cached_input_tokens"] * price["cached_input"] / 1_000_000
+    output_cost = usage["output_tokens"] * price["output"] / 1_000_000
+    return {
+        "pricing_available": True,
+        "pricing_key": pricing_key,
+        "pricing_updated_at": PRICING_UPDATED_AT,
+        "price_per_million": dict(price),
+        "input_cost_usd": input_cost,
+        "cached_input_cost_usd": cached_cost,
+        "output_cost_usd": output_cost,
+        "total_cost_usd": input_cost + cached_cost + output_cost,
+    }
+
+
+def build_usage_event(
+    response: Any,
+    *,
+    model: str,
+    operation: str,
+    method: str,
+    token_limit: int,
+) -> dict[str, Any]:
+    usage = extract_response_usage(response)
+    cost = calculate_usage_cost(model, usage)
+    response_id = str(get_attr(response, "id", "") or "").strip()
+    return {
+        "event_id": response_id,
+        "operation": operation,
+        "method": method,
+        "model": model,
+        "token_limit": token_limit,
+        "usage": usage,
+        "cost": cost,
+        "api_response_received": True,
+    }
+
+
+def usage_events_from_attempts(attempts: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for attempt in attempts or []:
+        if not isinstance(attempt, dict):
+            continue
+        event = attempt.get("usage_event")
+        if not isinstance(event, dict):
+            continue
+        event_id = str(event.get("event_id") or "")
+        # Response IDs are ideal for de-duplication. Fall back to object position when absent.
+        dedupe_key = event_id or f"anonymous-{id(event)}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        events.append(dict(event))
+    return events
+
+
+def merge_usage_events(existing: Iterable[dict[str, Any]], new: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in [*(existing or []), *(new or [])]:
+        if not isinstance(event, dict):
+            continue
+        event_id = str(event.get("event_id") or "")
+        if event_id:
+            key = event_id
+        else:
+            usage = event.get("usage") or {}
+            key = "|".join(
+                [
+                    str(event.get("operation") or ""),
+                    str(event.get("method") or ""),
+                    str(event.get("model") or ""),
+                    str(usage.get("input_tokens") or 0),
+                    str(usage.get("output_tokens") or 0),
+                    str(len(output)),
+                ]
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(dict(event))
+    return output
+
+
+def summarize_usage_events(events: Iterable[dict[str, Any]], usd_to_thb: float = 0.0) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "api_calls": 0,
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "non_cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+        "known_cost_usd": 0.0,
+        "estimated_cost_thb": 0.0,
+        "unknown_pricing_models": [],
+        "fully_priced": True,
+        "by_operation": {},
+        "by_model": {},
+    }
+    unknown: set[str] = set()
+    operation_buckets: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"api_calls": 0, "input_tokens": 0, "output_tokens": 0, "known_cost_usd": 0.0}
+    )
+    model_buckets: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"api_calls": 0, "input_tokens": 0, "output_tokens": 0, "known_cost_usd": 0.0}
+    )
+
+    for event in events or []:
+        if not isinstance(event, dict) or not event.get("api_response_received"):
+            continue
+        usage = event.get("usage") or {}
+        cost = event.get("cost") or {}
+        model = str(event.get("model") or "unknown")
+        operation = str(event.get("operation") or "api_call")
+        summary["api_calls"] += 1
+        for key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "non_cached_input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+        ):
+            summary[key] += safe_int(usage.get(key, 0))
+
+        usd = cost.get("total_cost_usd")
+        if usd is None:
+            unknown.add(model)
+        else:
+            summary["known_cost_usd"] += float(usd)
+
+        for bucket in (operation_buckets[operation], model_buckets[model]):
+            bucket["api_calls"] += 1
+            bucket["input_tokens"] += safe_int(usage.get("input_tokens", 0))
+            bucket["output_tokens"] += safe_int(usage.get("output_tokens", 0))
+            if usd is not None:
+                bucket["known_cost_usd"] += float(usd)
+
+    summary["unknown_pricing_models"] = sorted(unknown)
+    summary["fully_priced"] = not bool(unknown)
+    summary["estimated_cost_thb"] = summary["known_cost_usd"] * max(0.0, float(usd_to_thb or 0.0))
+    summary["by_operation"] = dict(operation_buckets)
+    summary["by_model"] = dict(model_buckets)
+    return summary
+
+
+def empty_usage_summary(usd_to_thb: float = 0.0) -> dict[str, Any]:
+    return summarize_usage_events([], usd_to_thb)
+
+# ========================================================================================
+# Inlined from: core/exporter.py
+# ========================================================================================
+
+import binascii
+import csv
+import io
+import json
+import re
+import shutil
+import struct
+import tempfile
+import time
+import zipfile
+from pathlib import Path
+from typing import Any, Iterable
+from xml.sax.saxutils import escape
+
+
+
+def safe_filename(filename: str) -> str:
+    name = Path(filename).name
+    name = re.sub(r"[\x00-\x1f]", "_", name)
+    return name or "image"
+
+
+def unique_filename(filename: str, used: set[str]) -> str:
+    filename = safe_filename(filename)
+    path = Path(filename)
+    candidate = filename
+    index = 2
+    while candidate.casefold() in used:
+        candidate = f"{path.stem}_{index}{path.suffix}"
+        index += 1
+    used.add(candidate.casefold())
+    return candidate
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    crc = binascii.crc32(chunk_type)
+    crc = binascii.crc32(data, crc) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+
+def _png_itxt(keyword: str, text: str) -> bytes:
+    keyword_bytes = keyword.encode("latin-1", errors="replace")[:79]
+    text_bytes = text.encode("utf-8")
+    data = (
+        keyword_bytes
+        + b"\x00"
+        + b"\x00"  # uncompressed
+        + b"\x00"  # compression method
+        + b"\x00"  # empty language tag
+        + b"\x00"  # empty translated keyword
+        + text_bytes
+    )
+    return _png_chunk(b"iTXt", data)
+
+
+def _xmp_packet(title: str, keywords: list[str]) -> str:
+    subject_items = "".join(f"<rdf:li>{escape(keyword)}</rdf:li>" for keyword in keywords)
+    return (
+        '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about="" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        f'<dc:title><rdf:Alt><rdf:li xml:lang="x-default">{escape(title)}</rdf:li></rdf:Alt></dc:title>'
+        f'<dc:description><rdf:Alt><rdf:li xml:lang="x-default">{escape(title)}</rdf:li></rdf:Alt></dc:description>'
+        f'<dc:subject><rdf:Bag>{subject_items}</rdf:Bag></dc:subject>'
+        '</rdf:Description></rdf:RDF></x:xmpmeta>'
+        '<?xpacket end="w"?>'
+    )
+
+
+def embed_png_metadata(original_bytes: bytes, title: str, keywords: list[str]) -> bytes:
+    """Insert iTXt chunks without decoding or re-encoding PNG pixel data."""
+    signature = b"\x89PNG\r\n\x1a\n"
+    if not original_bytes.startswith(signature):
+        raise ValueError("ไฟล์ PNG ไม่ถูกต้อง")
+
+    output = bytearray(signature)
+    offset = len(signature)
+    inserted = False
+    replacement_keys = {"title", "description", "keywords", "xml:com.adobe.xmp"}
+
+    while offset + 12 <= len(original_bytes):
+        length = struct.unpack(">I", original_bytes[offset : offset + 4])[0]
+        chunk_end = offset + 12 + length
+        if chunk_end > len(original_bytes):
+            raise ValueError("โครงสร้าง PNG ไม่สมบูรณ์")
+
+        chunk_type = original_bytes[offset + 4 : offset + 8]
+        chunk_data = original_bytes[offset + 8 : offset + 8 + length]
+        keep = True
+
+        if chunk_type in {b"tEXt", b"zTXt", b"iTXt"}:
+            raw_key = chunk_data.split(b"\x00", 1)[0]
+            key = raw_key.decode("latin-1", errors="ignore").casefold()
+            if key in replacement_keys:
+                keep = False
+
+        if chunk_type == b"IEND" and not inserted:
+            output.extend(_png_itxt("Title", title))
+            output.extend(_png_itxt("Description", title))
+            output.extend(_png_itxt("Keywords", ", ".join(keywords)))
+            output.extend(_png_itxt("XML:com.adobe.xmp", _xmp_packet(title, keywords)))
+            inserted = True
+
+        if keep:
+            output.extend(original_bytes[offset:chunk_end])
+        offset = chunk_end
+
+        if chunk_type == b"IEND":
+            break
+
+    if not inserted:
+        raise ValueError("ไม่พบ IEND chunk ในไฟล์ PNG")
+    return bytes(output)
+
+
+def embed_jpeg_iptc(original_bytes: bytes, suffix: str, title: str, keywords: list[str]) -> bytes:
+    try:
+        from iptcinfo3 import IPTCInfo
+    except ImportError as exc:
+        raise RuntimeError("ยังไม่ได้ติดตั้ง IPTCInfo3 จึงไม่สามารถฝัง IPTC ใน JPEG") from exc
+
+    with tempfile.TemporaryDirectory(prefix="ai_stock_vision_iptc_") as temp_dir:
+        input_path = Path(temp_dir) / f"input{suffix.lower()}"
+        output_path = Path(temp_dir) / f"output{suffix.lower()}"
+        input_path.write_bytes(original_bytes)
+        shutil.copy2(input_path, output_path)
+
+        info = IPTCInfo(str(output_path), force=True, inp_charset="utf8", out_charset="utf8")
+        info["object name"] = title
+        info["caption/abstract"] = title
+        info["keywords"] = list(keywords)
+        info.save_as(str(output_path), {"overwrite": True})
+
+        backup = Path(f"{output_path}~")
+        if backup.exists():
+            backup.unlink()
+        return output_path.read_bytes()
+
+
+def embed_metadata(record: dict[str, Any]) -> tuple[bytes, str | None]:
+    original_bytes = record["bytes"]
+    title = str(record.get("title") or "").strip()
+    keywords = parse_keywords(record.get("keywords"))
+    suffix = Path(record["filename"]).suffix.casefold()
 
     try:
-        secret_api_key = str(
-            st.secrets.get(
-                "OPENAI_API_KEY",
-                "",
+        if suffix == ".png":
+            return embed_png_metadata(original_bytes, title, keywords), None
+        if suffix in {".jpg", ".jpeg"}:
+            return embed_jpeg_iptc(original_bytes, suffix, title, keywords), None
+        return original_bytes, "ไม่รองรับการฝัง Metadata สำหรับนามสกุลนี้ จึงใช้ไฟล์ต้นฉบับ"
+    except Exception as exc:
+        return original_bytes, f"ฝัง Metadata ไม่สำเร็จ จึงใช้ไฟล์ต้นฉบับ: {type(exc).__name__}: {exc}"
+
+
+def adobe_csv_bytes(records: Iterable[dict[str, Any]]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["Filename", "Title", "Keywords", "Category", "Releases"],
+    )
+    writer.writeheader()
+    for record in records:
+        writer.writerow(
+            {
+                "Filename": record["export_filename"],
+                "Title": str(record.get("title") or "").strip(),
+                "Keywords": ", ".join(parse_keywords(record.get("keywords"))),
+                "Category": str(record.get("category") or "").strip(),
+                "Releases": str(record.get("releases") or "").strip(),
+            }
+        )
+    return output.getvalue().encode("utf-8-sig")
+
+
+def quality_csv_bytes(records: Iterable[dict[str, Any]]) -> bytes:
+    output = io.StringIO(newline="")
+    fields = [
+        "Filename",
+        "Quality Score",
+        "Quality Status",
+        "Keyword Count",
+        "Top 10 Coverage",
+        "Title Length",
+        "AI Relevance Score",
+        "AI Naturalness Score",
+        "AI Keyword Accuracy Score",
+        "AI Average",
+        "API Calls",
+        "Input Tokens",
+        "Cached Input Tokens",
+        "Output Tokens",
+        "API Cost USD",
+        "Estimated Cost THB",
+        "Unknown Pricing Models",
+        "Issues",
+        "Warnings",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for record in records:
+        quality = record.get("quality") or {}
+        review = record.get("ai_review") or {}
+        usage_summary = record.get("api_usage_summary") or summarize_usage_events(
+            record.get("api_usage_events", [])
+        )
+        writer.writerow(
+            {
+                "Filename": record["export_filename"],
+                "Quality Score": quality.get("score", ""),
+                "Quality Status": quality.get("status", ""),
+                "Keyword Count": quality.get("keyword_count", ""),
+                "Top 10 Coverage": f"{quality.get('top10_coverage', 0)}/{quality.get('top10_total', 10)}",
+                "Title Length": quality.get("title_length", ""),
+                "AI Relevance Score": review.get("relevance_score", ""),
+                "AI Naturalness Score": review.get("naturalness_score", ""),
+                "AI Keyword Accuracy Score": review.get("keyword_accuracy_score", ""),
+                "AI Average": ai_average(review) if review else "",
+                "API Calls": usage_summary.get("api_calls", 0),
+                "Input Tokens": usage_summary.get("input_tokens", 0),
+                "Cached Input Tokens": usage_summary.get("cached_input_tokens", 0),
+                "Output Tokens": usage_summary.get("output_tokens", 0),
+                "API Cost USD": f"{float(usage_summary.get('known_cost_usd', 0.0)):.8f}",
+                "Estimated Cost THB": f"{float(usage_summary.get('estimated_cost_thb', 0.0)):.6f}",
+                "Unknown Pricing Models": ", ".join(usage_summary.get("unknown_pricing_models", [])),
+                "Issues": " | ".join(quality.get("issues", [])),
+                "Warnings": " | ".join(quality.get("warnings", [])),
+            }
+        )
+    return output.getvalue().encode("utf-8-sig")
+
+
+def api_cost_csv_bytes(records: Iterable[dict[str, Any]]) -> bytes:
+    output = io.StringIO(newline="")
+    fields = [
+        "Filename",
+        "Operation",
+        "Model",
+        "Method",
+        "Input Tokens",
+        "Cached Input Tokens",
+        "Non-cached Input Tokens",
+        "Output Tokens",
+        "Reasoning Tokens",
+        "Total Tokens",
+        "Pricing Available",
+        "Pricing Key",
+        "Cost USD",
+    ]
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for record in records:
+        for event in record.get("api_usage_events", []) or []:
+            usage = event.get("usage") or {}
+            cost = event.get("cost") or {}
+            writer.writerow(
+                {
+                    "Filename": record["export_filename"],
+                    "Operation": event.get("operation", ""),
+                    "Model": event.get("model", ""),
+                    "Method": event.get("method", ""),
+                    "Input Tokens": usage.get("input_tokens", 0),
+                    "Cached Input Tokens": usage.get("cached_input_tokens", 0),
+                    "Non-cached Input Tokens": usage.get("non_cached_input_tokens", 0),
+                    "Output Tokens": usage.get("output_tokens", 0),
+                    "Reasoning Tokens": usage.get("reasoning_tokens", 0),
+                    "Total Tokens": usage.get("total_tokens", 0),
+                    "Pricing Available": cost.get("pricing_available", False),
+                    "Pricing Key": cost.get("pricing_key") or "",
+                    "Cost USD": (
+                        f"{float(cost['total_cost_usd']):.8f}"
+                        if cost.get("total_cost_usd") is not None
+                        else ""
+                    ),
+                }
             )
-        ).strip()
-    except Exception:
-        secret_api_key = ""
+    return output.getvalue().encode("utf-8-sig")
 
-    api_key = (
-        manual_api_key.strip()
-        or env_api_key
-        or secret_api_key
-    )
 
-    if st.button(
-        "🔄 รีเฟรชรายการโมเดล",
-        use_container_width=True,
+def build_export_zip(records: list[dict[str, Any]]) -> dict[str, Any]:
+    EXPORT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    zip_path = EXPORT_CACHE_DIR / f"ai_stock_vision_export_{timestamp}.zip"
+    used_names: set[str] = set()
+    export_records: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for record in records:
+        export_record = dict(record)
+        export_record["export_filename"] = unique_filename(record["filename"], used_names)
+        export_records.append(export_record)
+
+    adobe_csv = adobe_csv_bytes(export_records)
+    quality_csv = quality_csv_bytes(export_records)
+    api_cost_csv = api_cost_csv_bytes(export_records)
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for record in export_records:
+            embedded_bytes, warning = embed_metadata(record)
+            archive.writestr(f"images/{record['export_filename']}", embedded_bytes)
+            if warning:
+                warnings.append(f"{record['export_filename']}: {warning}")
+        archive.writestr("adobe_stock_metadata.csv", adobe_csv)
+        archive.writestr("quality_report.csv", quality_csv)
+        archive.writestr("api_cost_report.csv", api_cost_csv)
+        if warnings:
+            archive.writestr(
+                "export_warnings.txt",
+                "\n".join(warnings).encode("utf-8"),
+            )
+
+    return {
+        "zip_path": str(zip_path),
+        "zip_bytes": zip_path.read_bytes(),
+        "filename": zip_path.name,
+        "adobe_csv": adobe_csv,
+        "quality_csv": quality_csv,
+        "api_cost_csv": api_cost_csv,
+        "warnings": warnings,
+        "exported_count": len(export_records),
+    }
+
+# ========================================================================================
+# Inlined from: core/openai_service.py
+# ========================================================================================
+
+import json
+import re
+from typing import Any, Callable, Iterable, TypeVar
+
+from openai import OpenAI
+from pydantic import BaseModel, Field
+
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class MetadataSchema(BaseModel):
+    title: str = ""
+    keywords: list[str] = Field(default_factory=list)
+    category: str = ""
+    releases: str = ""
+
+
+class TitleSchema(BaseModel):
+    title: str = ""
+
+
+class ReviewSchema(BaseModel):
+    relevance_score: int = Field(default=0, ge=0, le=100)
+    naturalness_score: int = Field(default=0, ge=0, le=100)
+    keyword_accuracy_score: int = Field(default=0, ge=0, le=100)
+    brand_logo_risk: bool = False
+    model_release: str = "uncertain"
+    property_release: str = "uncertain"
+    issues: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+def get_attr(obj: Any, name: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def model_to_dict(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        return dumped if isinstance(dumped, dict) else None
+    if hasattr(value, "dict"):
+        dumped = value.dict()
+        return dumped if isinstance(dumped, dict) else None
+    return None
+
+
+def redact_secrets(value: Any, api_key: str | None = None) -> str:
+    text = str(value or "")
+    if api_key:
+        text = text.replace(api_key, "[REDACTED_API_KEY]")
+    text = re.sub(r"\bsk-[A-Za-z0-9_\-]{8,}\b", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"Bearer\s+[A-Za-z0-9._\-]+", "Bearer [REDACTED]", text, flags=re.I)
+    return text
+
+
+def extract_response_text(response: Any) -> tuple[str, list[str]]:
+    texts: list[str] = []
+    refusals: list[str] = []
+
+    output_text = get_attr(response, "output_text", "")
+    if isinstance(output_text, str) and output_text.strip():
+        texts.append(output_text.strip())
+
+    output = get_attr(response, "output", []) or []
+    for item in output:
+        if get_attr(item, "type", "") != "message":
+            continue
+        for content in get_attr(item, "content", []) or []:
+            content_type = get_attr(content, "type", "")
+            if content_type == "output_text":
+                text = get_attr(content, "text", "")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+            elif content_type == "refusal":
+                refusal = get_attr(content, "refusal", "") or get_attr(content, "text", "")
+                if refusal:
+                    refusals.append(str(refusal))
+
+    unique_texts = list(dict.fromkeys(texts))
+    return "\n".join(unique_texts).strip(), refusals
+
+
+def response_diagnostics(
+    response: Any,
+    model: str,
+    token_limit: int,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    raw_text, refusals = extract_response_text(response)
+    incomplete = get_attr(response, "incomplete_details", None)
+    error = get_attr(response, "error", None)
+    output = get_attr(response, "output", []) or []
+
+    return {
+        "status": str(get_attr(response, "status", "unknown")),
+        "incomplete_reason": get_attr(incomplete, "reason", None),
+        "error_code": get_attr(error, "code", None),
+        "error_message": redact_secrets(get_attr(error, "message", ""), api_key),
+        "refusals": [redact_secrets(item, api_key) for item in refusals],
+        "raw_output": redact_secrets(raw_text, api_key)[:12000],
+        "model": model,
+        "token_limit": token_limit,
+        "output_types": [str(get_attr(item, "type", "unknown")) for item in output],
+    }
+
+
+def classify_api_error(exc: Exception, api_key: str | None = None) -> dict[str, str]:
+    name = type(exc).__name__
+    message = redact_secrets(str(exc), api_key)
+    lowered = message.casefold()
+    status_code = str(get_attr(exc, "status_code", ""))
+    code = str(get_attr(get_attr(exc, "body", {}), "code", ""))
+
+    if name == "AuthenticationError" or status_code == "401" or "invalid api key" in lowered:
+        friendly = "API Key ไม่ถูกต้อง ถูกยกเลิก หรือหมดอายุ"
+    elif (
+        name == "NotFoundError"
+        or status_code == "404"
+        or "model_not_found" in lowered
+        or "does not exist" in lowered
     ):
-        st.session_state.model_refresh_version += 1
-        st.rerun()
-
-    available_models, model_error = (
-        get_available_models(api_key)
-    )
-
-    if available_models:
-        model_choice = st.selectbox(
-            "🤖 Model ที่ API Key เข้าถึงได้",
-            options=available_models,
-            index=0,
-            help=(
-                "Models API บอกสิทธิ์เข้าถึง "
-                "แต่บางโมเดลอาจไม่รองรับ input_image"
-            ),
-        )
-
-        use_custom_model = st.checkbox(
-            "กรอก Model ID เอง",
-            value=False,
-        )
-
-        if use_custom_model:
-            model_choice = st.text_input(
-                "Custom Model ID",
-                value=model_choice,
-            ).strip()
-
+        friendly = "ไม่พบโมเดล หรือ API Key ไม่มีสิทธิ์ใช้โมเดลนี้"
+    elif (
+        "insufficient_quota" in lowered
+        or "billing" in lowered
+        or "quota" in lowered
+        or "credit balance" in lowered
+    ):
+        friendly = "บัญชีไม่มีโควตา หรือยังไม่ได้ตั้งค่า Billing"
+    elif name == "RateLimitError" or status_code == "429":
+        friendly = "เรียก API ถี่เกินไปหรือชน Rate Limit กรุณาลดจำนวนงานพร้อมกันแล้วลองใหม่"
+    elif "image" in lowered and any(
+        token in lowered
+        for token in ("unsupported", "not support", "invalid_image", "media type")
+    ):
+        friendly = "โมเดลนี้ไม่รองรับ Image Input หรือรูปแบบภาพที่ส่งไม่รองรับ"
+    elif "max_output_tokens" in lowered:
+        friendly = "คำตอบถูกตัดเนื่องจาก max_output_tokens ไม่เพียงพอ"
+    elif name == "APIConnectionError":
+        friendly = "เชื่อมต่อ OpenAI API ไม่สำเร็จ กรุณาตรวจอินเทอร์เน็ตหรือเครือข่าย"
+    elif name in {"BadRequestError", "UnprocessableEntityError"} or status_code in {"400", "422"}:
+        friendly = "คำขอไม่ถูกต้อง โมเดลนี้อาจไม่รองรับพารามิเตอร์หรือ Image Input ที่ใช้"
     else:
-        if model_error:
-            st.warning(
-                "ดึงรายการโมเดลไม่ได้: "
-                + redact_secrets(model_error)
+        friendly = "เกิดข้อผิดพลาดระหว่างเรียก OpenAI API"
+
+    return {
+        "friendly": friendly,
+        "exception_type": name,
+        "status_code": status_code,
+        "code": code,
+        "detail": message[:4000],
+    }
+
+
+def parse_json_direct(raw_text: str) -> dict[str, Any] | None:
+    text = raw_text.strip()
+    if not text:
+        return None
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_balanced_json_objects(text: str) -> list[str]:
+    objects: list[str] = []
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escape = False
+
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start : index + 1])
+                start = None
+    return objects
+
+
+def parse_json_block(raw_text: str) -> dict[str, Any] | None:
+    for block in extract_balanced_json_objects(raw_text):
+        try:
+            value = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def parse_metadata_text(raw_text: str) -> dict[str, Any] | None:
+    title_match = re.search(
+        r"(?im)^\s*title\s*:\s*(.+?)(?=\n\s*(?:keywords?|category|releases?)\s*:|\Z)",
+        raw_text,
+        flags=re.S,
+    )
+    keywords_match = re.search(
+        r"(?im)^\s*keywords?\s*:\s*(.+?)(?=\n\s*(?:title|category|releases?)\s*:|\Z)",
+        raw_text,
+        flags=re.S,
+    )
+    if not title_match and not keywords_match:
+        return None
+
+    payload: dict[str, Any] = {
+        "title": title_match.group(1).strip() if title_match else "",
+        "keywords": parse_keywords(keywords_match.group(1)) if keywords_match else [],
+    }
+    category_match = re.search(r"(?im)^\s*category\s*:\s*(.+)$", raw_text)
+    releases_match = re.search(r"(?im)^\s*releases?\s*:\s*(.+)$", raw_text)
+    if category_match:
+        payload["category"] = category_match.group(1).strip()
+    if releases_match:
+        payload["releases"] = releases_match.group(1).strip()
+    return payload
+
+
+def parse_title_text(raw_text: str) -> dict[str, Any] | None:
+    parsed = parse_json_direct(raw_text) or parse_json_block(raw_text)
+    if parsed and parsed.get("title"):
+        return {"title": str(parsed["title"]).strip()}
+    match = re.search(r"(?im)^\s*title\s*:\s*(.+)$", raw_text)
+    if match:
+        return {"title": match.group(1).strip().strip('"')}
+    single_line = raw_text.strip().strip('"`')
+    if single_line and "\n" not in single_line and len(single_line) <= 300:
+        return {"title": single_line}
+    return None
+
+
+def parse_review_text(raw_text: str) -> dict[str, Any] | None:
+    parsed = parse_json_direct(raw_text) or parse_json_block(raw_text)
+    return parsed if isinstance(parsed, dict) else None
+
+
+def clean_metadata_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    title = str(payload.get("title") or "").strip().strip('"')
+    keywords = parse_keywords(payload.get("keywords"))
+    return {
+        "title": title,
+        "keywords": keywords,
+        "category": str(payload.get("category") or "").strip(),
+        "releases": str(payload.get("releases") or "").strip(),
+    }
+
+
+def metadata_payload_is_usable(payload: dict[str, Any]) -> bool:
+    cleaned = clean_metadata_payload(payload)
+    normalized = [re.sub(r"[^a-z0-9]+", " ", item.casefold()).strip() for item in cleaned["keywords"]]
+    return (
+        bool(cleaned["title"])
+        and len(cleaned["keywords"]) == 49
+        and len(set(normalized)) == 49
+        and all(normalized)
+    )
+
+
+def title_payload_is_usable(payload: dict[str, Any]) -> bool:
+    return bool(str(payload.get("title") or "").strip())
+
+
+def review_payload_is_usable(payload: dict[str, Any]) -> bool:
+    required = {"relevance_score", "naturalness_score", "keyword_accuracy_score"}
+    return required.issubset(payload.keys())
+
+
+def metadata_prompt(blacklist: list[str]) -> str:
+    blacklist_text = ", ".join(sorted(set(blacklist))) if blacklist else "none supplied"
+    return f"""
+You are an expert Adobe Stock metadata editor. Analyze only what is visibly supported by the supplied image.
+
+Return one JSON object with this exact shape:
+{{
+  "title": "English title",
+  "keywords": ["keyword 1", "keyword 2", "... exactly 49 total"],
+  "category": "",
+  "releases": ""
+}}
+
+Work in this order:
+1. Create exactly 49 distinct English keywords, ordered from most important to least important.
+2. Keep the first 10 keywords short, concrete, commercially useful, and visually grounded. Multi-word phrases are allowed.
+3. After the keyword list is final, write one natural English title of roughly 100–200 characters, never over 200 characters.
+4. Every one of keywords 1–10 must appear in the title as the same exact word or contiguous phrase, ignoring capitalization only. Do not substitute synonyms.
+5. The title must read naturally and must not look like a comma-separated keyword dump.
+
+Hard rules:
+- Do not begin with "Image of", "Photo of", or "Picture of".
+- Do not infer location, nationality, ethnicity, profession, relationship, health status, age, identity, or intent unless visually unmistakable.
+- Do not include brand names, logos, trademarks, celebrity names, copyrighted character names, camera brands, or stock-platform names.
+- If a logo or brand mark is visible, describe the generic object instead and do not transcribe the brand.
+- No duplicate keywords, including differences caused only by capitalization or punctuation.
+- Avoid speculative concepts that are not supported by the visible scene.
+- Do not include any of these blacklist terms as keywords: {blacklist_text}
+- Output JSON only. Do not add Markdown fences or commentary.
+""".strip()
+
+
+def title_repair_prompt(title: str, top10: list[str]) -> str:
+    return f"""
+Rewrite the title below for Adobe Stock metadata.
+
+Current title:
+{title}
+
+Required keywords, in priority order:
+{json.dumps(top10, ensure_ascii=False)}
+
+Rules:
+- Use every required keyword exactly as written, as a contiguous phrase, ignoring capitalization only.
+- Keep the meaning limited to the current title and required keywords. Do not add new visual facts.
+- Write one natural English sentence, not a keyword dump.
+- Maximum 200 characters.
+- Do not begin with Image of, Photo of, or Picture of.
+- Return JSON only: {{"title": "..."}}
+""".strip()
+
+
+def review_prompt(title: str, keywords: list[str]) -> str:
+    return f"""
+Review this Adobe Stock metadata against the supplied image. Judge only visible evidence.
+
+Title:
+{title}
+
+Keywords:
+{json.dumps(keywords, ensure_ascii=False)}
+
+Return JSON only with this shape:
+{{
+  "relevance_score": 0,
+  "naturalness_score": 0,
+  "keyword_accuracy_score": 0,
+  "brand_logo_risk": false,
+  "model_release": "likely_required|not_required|uncertain",
+  "property_release": "likely_required|not_required|uncertain",
+  "issues": ["short issue"],
+  "notes": "short note"
+}}
+
+Scoring is 0–100. Penalize unsupported claims, keyword stuffing, inaccurate keywords, visible branding risk, or unnatural English. Do not identify people or brands.
+""".strip()
+
+
+def build_image_input(prompt: str, data_url: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": data_url},
+            ],
+        }
+    ]
+
+
+def build_text_input(prompt: str) -> list[dict[str, Any]]:
+    return [{"role": "user", "content": prompt}]
+
+
+def call_structured(
+    client: OpenAI,
+    model: str,
+    input_payload: list[dict[str, Any]],
+    schema: type[T],
+    token_limit: int,
+    api_key: str,
+    operation: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any], Any]:
+    response = client.responses.parse(
+        model=model,
+        store=False,
+        input=input_payload,
+        text_format=schema,
+        max_output_tokens=token_limit,
+    )
+    diagnostics = response_diagnostics(response, model, token_limit, api_key)
+    diagnostics["usage_event"] = build_usage_event(
+        response,
+        model=model,
+        operation=operation,
+        method="structured_output",
+        token_limit=token_limit,
+    )
+    parsed = model_to_dict(get_attr(response, "output_parsed", None))
+    return parsed, diagnostics, response
+
+
+def call_plain(
+    client: OpenAI,
+    model: str,
+    input_payload: list[dict[str, Any]],
+    token_limit: int,
+    api_key: str,
+    operation: str,
+) -> tuple[str, dict[str, Any], Any]:
+    response = client.responses.create(
+        model=model,
+        store=False,
+        input=input_payload,
+        max_output_tokens=token_limit,
+    )
+    diagnostics = response_diagnostics(response, model, token_limit, api_key)
+    diagnostics["usage_event"] = build_usage_event(
+        response,
+        model=model,
+        operation=operation,
+        method="plain_response",
+        token_limit=token_limit,
+    )
+    raw_text, _ = extract_response_text(response)
+    return raw_text, diagnostics, response
+
+
+def _execute_hybrid_single_model(
+    *,
+    client: OpenAI,
+    model: str,
+    input_payload: list[dict[str, Any]],
+    schema: type[T],
+    fallback_parser: Callable[[str], dict[str, Any] | None],
+    api_key: str,
+    operation: str,
+    data_validator: Callable[[dict[str, Any]], bool] | None = None,
+    token_ladder: tuple[int, ...] = TOKEN_LADDER,
+) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+
+    def accepted(data: dict[str, Any] | None, method: str) -> bool:
+        if not data:
+            return False
+        if data_validator is None or data_validator(data):
+            return True
+        attempts.append(
+            {
+                "method": method,
+                "model": model,
+                "validation_error": "Parsed output did not satisfy task-level metadata requirements",
+            }
+        )
+        return False
+
+    # Layer 1: Structured Output. Failure does not stop the workflow.
+    first_limit = token_ladder[0]
+    try:
+        parsed, diagnostics, response = call_structured(
+            client, model, input_payload, schema, first_limit, api_key, operation
+        )
+        diagnostics["method"] = "structured_output"
+        attempts.append(diagnostics)
+        if accepted(parsed, "structured_output_validation"):
+            return {
+                "ok": True,
+                "data": parsed,
+                "attempts": attempts,
+                "method": "structured_output",
+                "model_used": model,
+            }
+
+        raw_text, _ = extract_response_text(response)
+        parsed_from_raw = (
+            parse_json_direct(raw_text)
+            or parse_json_block(raw_text)
+            or fallback_parser(raw_text)
+        )
+        if accepted(parsed_from_raw, "structured_raw_validation"):
+            return {
+                "ok": True,
+                "data": parsed_from_raw,
+                "attempts": attempts,
+                "method": "structured_raw_fallback",
+                "model_used": model,
+            }
+    except Exception as exc:  # SDK/model compatibility varies; continue to plain response.
+        attempts.append(
+            {
+                "method": "structured_output",
+                "model": model,
+                "token_limit": first_limit,
+                "exception": classify_api_error(exc, api_key),
+            }
+        )
+
+    # Layers 2–4: plain response -> direct JSON -> JSON block -> text parser.
+    for token_limit in token_ladder:
+        try:
+            raw_text, diagnostics, response = call_plain(
+                client, model, input_payload, token_limit, api_key, operation
             )
+            diagnostics["method"] = "plain_response"
+            attempts.append(diagnostics)
 
-        model_choice = st.text_input(
-            "🤖 Model ID",
-            value="gpt-4.1",
-            help=(
-                "ใส่ API Key แล้วกดรีเฟรช "
-                "เพื่อดูโมเดลที่บัญชีเข้าถึงได้จริง"
-            ),
-        ).strip()
-
-    category_name = st.selectbox(
-        "📁 Adobe Category",
-        options=list(CATEGORY_DICT.keys()),
-        index=2,
-    )
-    category_num = CATEGORY_DICT[category_name]
-
-    hint = st.text_area(
-        "💡 Context Hint",
-        placeholder=(
-            "เช่น young woman stretching "
-            "before tennis workout"
-        ),
-    )
-
-    blacklist_raw = st.text_area(
-        "🛡️ Blacklist Keywords",
-        value=DEFAULT_BLACKLIST,
-    )
-    blacklist = parse_blacklist(blacklist_raw)
-
-    auto_ai_review = st.checkbox(
-        "ให้ AI ตรวจความตรงภาพหลังสร้างอัตโนมัติ",
-        value=True,
-        help=(
-            "แม่นขึ้น แต่มี API cost เพิ่มอีกหนึ่ง request ต่อภาพ"
-        ),
-    )
-
-    prevent_failed_export = st.checkbox(
-        "ไม่ให้ Export ภาพที่ไม่ผ่านคุณภาพ",
-        value=True,
-    )
-
-    st.divider()
-
-    server_files, server_bytes = directory_stats(
-        APP_CACHE_DIR
-    )
-
-    st.caption(
-        f"Server cache: {server_files:,} files • "
-        f"{human_size(server_bytes)}"
-    )
-
-    confirm_cleanup = st.checkbox(
-        "ยืนยันการล้างแคชบนเซิร์ฟเวอร์",
-        value=False,
-    )
-
-    if st.button(
-        "🧹 ล้างแคชภาพทั้งหมดบนเซิร์ฟเวอร์",
-        use_container_width=True,
-        disabled=not confirm_cleanup,
-    ):
-        deleted_files, deleted_bytes = (
-            clear_server_cache()
-        )
-
-        st.success(
-            f"ล้างแล้ว {deleted_files:,} ไฟล์ • "
-            f"คืนพื้นที่ {human_size(deleted_bytes)}"
-        )
-
-
-# =========================================================
-# 13) MAIN UI
-# =========================================================
-try:
-    if st.session_state.flash_message:
-        st.success(st.session_state.flash_message)
-        st.session_state.flash_message = ""
-
-    uploader_key = (
-        f"image_uploader_"
-        f"{st.session_state.uploader_version}"
-    )
-
-    uploaded_files = st.file_uploader(
-        "📸 อัปโหลดรูปภาพ JPG, JPEG หรือ PNG",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key=uploader_key,
-    )
-
-    payloads = (
-        prepare_uploads(uploaded_files)
-        if uploaded_files
-        else []
-    )
-
-    action_col1, action_col2 = st.columns(2)
-
-    with action_col1:
-        analyze_all_clicked = st.button(
-            "🚀 วิเคราะห์และตรวจคุณภาพทั้งหมด",
-            type="primary",
-            use_container_width=True,
-            disabled=not payloads,
-        )
-
-    with action_col2:
-        clear_page_clicked = st.button(
-            "🗑️ ล้างภาพออกจากหน้าอัปโหลด",
-            use_container_width=True,
-            disabled=not payloads,
-            help=(
-                "ล้างเฉพาะภาพและผลในหน้านี้ "
-                "ไม่ลบแคชบนเซิร์ฟเวอร์"
-            ),
-        )
-
-    if clear_page_clicked:
-        clear_page_uploads()
-        st.rerun()
-
-    if analyze_all_clicked:
-        if not api_key:
-            st.error("กรุณาใส่ OpenAI API Key")
-        elif not model_choice:
-            st.error("กรุณาเลือกหรือกรอก Model ID")
-        else:
-            valid_payloads = [
-                payload
-                for payload in payloads
-                if payload["valid"]
-            ]
-
-            progress = st.progress(0)
-            status = st.empty()
-
-            for index, payload in enumerate(
-                valid_payloads,
-                start=1,
-            ):
-                status.info(
-                    f"กำลังสร้าง Metadata "
-                    f"{index}/{len(valid_payloads)}: "
-                    f"{payload['original_name']}"
-                )
-
-                generation_cache_key = stable_hash({
-                    "file_hash": sha256_bytes(
-                        payload["bytes"]
-                    ),
-                    "model": model_choice,
-                    "category": category_num,
-                    "hint": hint,
-                    "blacklist": blacklist,
-                    "prompt_version": 8,
-                })
-
-                if (
-                    generation_cache_key
-                    in st.session_state.analysis_cache
-                ):
-                    generated = (
-                        st.session_state.analysis_cache[
-                            generation_cache_key
-                        ]
-                    )
-                else:
-                    generated = generate_metadata(
-                        image_bytes=payload["bytes"],
-                        api_key=api_key,
-                        model=model_choice,
-                        category_name=category_name,
-                        category_num=category_num,
-                        hint=hint,
-                        blacklist=blacklist,
-                    )
-                    st.session_state.analysis_cache[
-                        generation_cache_key
-                    ] = generated
-
-                ai_review: Optional[Dict[str, Any]] = None
-
-                if (
-                    auto_ai_review
-                    and not generated["error"]
-                ):
-                    status.info(
-                        f"กำลังตรวจความตรงภาพ "
-                        f"{index}/{len(valid_payloads)}: "
-                        f"{payload['original_name']}"
-                    )
-
-                    review_cache_key = stable_hash({
-                        "file_hash": sha256_bytes(
-                            payload["bytes"]
-                        ),
-                        "title": generated["title"],
-                        "keywords": generated["keywords"],
-                        "model": model_choice,
-                        "review_version": 3,
-                    })
-
-                    if (
-                        review_cache_key
-                        in st.session_state.quality_cache
-                    ):
-                        ai_review = (
-                            st.session_state.quality_cache[
-                                review_cache_key
-                            ]
-                        )
-                    else:
-                        ai_review = ai_quality_review(
-                            image_bytes=payload["bytes"],
-                            title=generated["title"],
-                            keywords=generated["keywords"],
-                            api_key=api_key,
-                            model=model_choice,
-                        )
-                        st.session_state.quality_cache[
-                            review_cache_key
-                        ] = ai_review
-
-                quality = deterministic_quality_check(
-                    title=generated["title"],
-                    keywords=generated["keywords"],
-                    blacklist=blacklist,
-                    ai_review=(
-                        ai_review
-                        if ai_review
-                        and not ai_review.get("error")
-                        else None
-                    ),
-                )
-
-                st.session_state.results[payload["id"]] = {
-                    **payload,
-                    **generated,
-                    "category": category_num,
-                    "ai_review": ai_review,
-                    "quality": quality,
+            parsed = (
+                parse_json_direct(raw_text)
+                or parse_json_block(raw_text)
+                or fallback_parser(raw_text)
+            )
+            if accepted(parsed, "plain_response_validation"):
+                return {
+                    "ok": True,
+                    "data": parsed,
+                    "attempts": attempts,
+                    "method": "plain_fallback",
+                    "model_used": model,
                 }
 
-                st.session_state[
-                    f"title_{payload['id']}"
-                ] = generated["title"]
-
-                st.session_state[
-                    f"keywords_{payload['id']}"
-                ] = generated["keywords"]
-
-                progress.progress(
-                    index / max(len(valid_payloads), 1)
-                )
-
-            status.success(
-                "สร้างและตรวจคุณภาพเรียบร้อย"
+            reason = diagnostics.get("incomplete_reason")
+            if reason != "max_output_tokens" and raw_text.strip():
+                break
+        except Exception as exc:
+            error = classify_api_error(exc, api_key)
+            attempts.append(
+                {
+                    "method": "plain_response",
+                    "model": model,
+                    "token_limit": token_limit,
+                    "exception": error,
+                }
             )
-            st.rerun()
+            # These errors will not improve by adding output tokens for the same model.
+            if error["friendly"] in {
+                "API Key ไม่ถูกต้อง ถูกยกเลิก หรือหมดอายุ",
+                "บัญชีไม่มีโควตา หรือยังไม่ได้ตั้งค่า Billing",
+                "ไม่พบโมเดล หรือ API Key ไม่มีสิทธิ์ใช้โมเดลนี้",
+                "โมเดลนี้ไม่รองรับ Image Input หรือรูปแบบภาพที่ส่งไม่รองรับ",
+                "คำขอไม่ถูกต้อง โมเดลนี้อาจไม่รองรับพารามิเตอร์หรือ Image Input ที่ใช้",
+            }:
+                break
 
-    final_items: List[Dict[str, Any]] = []
-    failed_items: List[str] = []
+    return {
+        "ok": False,
+        "data": None,
+        "attempts": attempts,
+        "method": "failed",
+        "model_used": None,
+        "error": "โมเดลตอบกลับมา แต่รูปแบบ Metadata ไม่ถูกต้อง หรือไม่มีผลลัพธ์ที่นำมาใช้ได้",
+    }
 
-    for payload in payloads:
-        with st.container(border=True):
-            image_col, detail_col = st.columns(
-                [1, 2],
-                gap="large",
+
+def _has_global_fatal_error(attempts: list[dict[str, Any]]) -> bool:
+    """Stop trying other models when the issue is account/network-wide."""
+    fatal_messages = {
+        "API Key ไม่ถูกต้อง ถูกยกเลิก หรือหมดอายุ",
+        "บัญชีไม่มีโควตา หรือยังไม่ได้ตั้งค่า Billing",
+        "เรียก API ถี่เกินไปหรือชน Rate Limit กรุณาลดจำนวนงานพร้อมกันแล้วลองใหม่",
+        "เชื่อมต่อ OpenAI API ไม่สำเร็จ กรุณาตรวจอินเทอร์เน็ตหรือเครือข่าย",
+    }
+    for attempt in attempts:
+        exception = attempt.get("exception") if isinstance(attempt, dict) else None
+        if isinstance(exception, dict) and exception.get("friendly") in fatal_messages:
+            return True
+    return False
+
+
+def normalize_model_candidates(model: str | Iterable[str]) -> list[str]:
+    if isinstance(model, str):
+        raw_models = [model]
+    else:
+        raw_models = [str(item) for item in model]
+    return list(
+        dict.fromkeys(
+            item.strip()
+            for item in raw_models
+            if item and item.strip() and item.strip() != AUTO_MODEL_OPTION
+        )
+    )
+
+
+def execute_hybrid(
+    *,
+    client: OpenAI,
+    model: str | Iterable[str],
+    input_payload: list[dict[str, Any]],
+    schema: type[T],
+    fallback_parser: Callable[[str], dict[str, Any] | None],
+    api_key: str,
+    operation: str = "api_call",
+    data_validator: Callable[[dict[str, Any]], bool] | None = None,
+    token_ladder: tuple[int, ...] = TOKEN_LADDER,
+) -> dict[str, Any]:
+    """Try the selected model, then automatically fall back to compatible models."""
+    candidates = normalize_model_candidates(model)[:6]
+    if not candidates:
+        candidates = list(MODEL_DISCOVERY_FAILURE_CHAIN)[:6]
+
+    all_attempts: list[dict[str, Any]] = []
+    models_tried: list[str] = []
+    last_error = "ไม่พบโมเดลที่ใช้งานได้"
+
+    for candidate in candidates:
+        models_tried.append(candidate)
+        result = _execute_hybrid_single_model(
+            client=client,
+            model=candidate,
+            input_payload=input_payload,
+            schema=schema,
+            fallback_parser=fallback_parser,
+            api_key=api_key,
+            operation=operation,
+            data_validator=data_validator,
+            token_ladder=token_ladder,
+        )
+        all_attempts.extend(result.get("attempts", []))
+        if result.get("ok"):
+            result["attempts"] = all_attempts
+            result["models_tried"] = models_tried
+            result["fallback_used"] = len(models_tried) > 1
+            result["usage_summary"] = summarize_usage_events(
+                usage_events_from_attempts(all_attempts)
+            )
+            return result
+
+        last_error = str(result.get("error") or last_error)
+        if _has_global_fatal_error(result.get("attempts", [])):
+            break
+
+    return {
+        "ok": False,
+        "data": None,
+        "attempts": all_attempts,
+        "method": "failed",
+        "model_used": None,
+        "models_tried": models_tried,
+        "fallback_used": len(models_tried) > 1,
+        "error": last_error,
+        "usage_summary": summarize_usage_events(
+            usage_events_from_attempts(all_attempts)
+        ),
+    }
+
+
+def _model_rank_key(model_id: str) -> tuple[int, int, str]:
+    lowered = model_id.casefold()
+
+    # Exact aliases first, so gpt-4.1-mini is not accidentally ranked as gpt-4.1.
+    for index, preferred in enumerate(MODEL_QUALITY_PRIORITY):
+        if lowered == preferred.casefold():
+            return (index, 0, lowered)
+
+    for index, preferred in enumerate(MODEL_QUALITY_PRIORITY):
+        preferred_lower = preferred.casefold()
+        if lowered.startswith(preferred_lower + "-"):
+            # Prefer stable aliases over dated snapshots / derivative variants.
+            penalty = 4
+            if "mini" in lowered:
+                penalty += 20
+            if "nano" in lowered:
+                penalty += 40
+            if "preview" in lowered:
+                penalty += 10
+            return (index, penalty, lowered)
+
+    family_penalty = 900
+    if lowered.startswith("gpt-5"):
+        family_penalty = 500
+    elif lowered.startswith(("gpt-4.1", "gpt-4o", "gpt-4.5")):
+        family_penalty = 600
+    elif lowered.startswith(("o4", "o3", "o1")):
+        family_penalty = 700
+    return (family_penalty, 0, lowered)
+
+
+def rank_models(models: Iterable[str]) -> list[str]:
+    cleaned = list(dict.fromkeys(str(model).strip() for model in models if str(model).strip()))
+    return sorted(cleaned, key=_model_rank_key)
+
+
+def discover_models(api_key: str) -> list[str]:
+    client = OpenAI(api_key=api_key, timeout=120.0, max_retries=2)
+    page = client.models.list()
+    model_ids = {
+        str(get_attr(item, "id", "")).strip()
+        for item in (get_attr(page, "data", []) or [])
+        if str(get_attr(item, "id", "")).strip()
+    }
+
+    candidates = [
+        model_id
+        for model_id in model_ids
+        if not any(token in model_id.casefold() for token in OBVIOUS_NON_VISION_MODEL_TOKENS)
+        and model_id.casefold().startswith(("gpt-", "o1", "o3", "o4"))
+    ]
+    return rank_models(candidates or model_ids)
+
+
+def choose_default_model(models: list[str]) -> str:
+    ranked = rank_models(models)
+    return ranked[0] if ranked else DEFAULT_MODEL_ID
+
+
+def build_model_fallback_chain(
+    available_models: list[str] | None,
+    selected_model: str = AUTO_MODEL_OPTION,
+    auto_fallback: bool = True,
+) -> list[str]:
+    """Build a safe chain without assuming that any unlisted model exists."""
+    ranked_available = rank_models(available_models or [])
+    discovered = bool(ranked_available)
+    base_chain = (ranked_available[:6] if discovered else list(MODEL_DISCOVERY_FAILURE_CHAIN)[:6])
+
+    selected = (selected_model or AUTO_MODEL_OPTION).strip()
+    if selected == AUTO_MODEL_OPTION:
+        chain = list(base_chain)
+    else:
+        chain = [selected]
+        if auto_fallback:
+            chain.extend(base_chain)
+
+    # Keep the old reliable vision model as a last-resort compatibility fallback
+    # only when discovery failed or the account explicitly exposes it.
+    if auto_fallback and (
+        not discovered or LEGACY_VISION_FALLBACK_MODEL_ID in ranked_available
+    ):
+        chain.append(LEGACY_VISION_FALLBACK_MODEL_ID)
+
+    return list(dict.fromkeys(model for model in chain if model and model != AUTO_MODEL_OPTION))
+
+
+def analyze_image(
+    *,
+    original_bytes: bytes,
+    image_sha256: str,
+    api_key: str,
+    model: str | Iterable[str],
+    blacklist: list[str],
+    use_cache: bool = True,
+    auto_repair_title: bool = True,
+) -> dict[str, Any]:
+    model_candidates = normalize_model_candidates(model)
+    model_signature = json.dumps(model_candidates, ensure_ascii=False)
+    cache_file = cache_path(
+        ANALYSIS_CACHE_DIR,
+        "metadata",
+        image_sha256,
+        model_signature,
+        json.dumps(sorted(blacklist), ensure_ascii=False),
+    )
+    if use_cache:
+        cached = read_json(cache_file)
+        if cached and cached.get("ok"):
+            cached["from_cache"] = True
+            return cached
+
+    data_url, analysis_info = create_analysis_data_url(original_bytes)
+    client = OpenAI(api_key=api_key, timeout=120.0, max_retries=2)
+    result = execute_hybrid(
+        client=client,
+        model=model,
+        input_payload=build_image_input(metadata_prompt(blacklist), data_url),
+        schema=MetadataSchema,
+        fallback_parser=parse_metadata_text,
+        api_key=api_key,
+        operation="generate_metadata",
+        data_validator=metadata_payload_is_usable,
+    )
+
+    if not result.get("ok"):
+        result["analysis_info"] = analysis_info
+        return result
+
+    cleaned = clean_metadata_payload(result["data"])
+    result["data"] = cleaned
+    result["analysis_info"] = analysis_info
+    result["from_cache"] = False
+
+    if auto_repair_title and len(cleaned["keywords"]) >= 10:
+        coverage = top_keyword_coverage(cleaned["title"], cleaned["keywords"])
+        if coverage["count"] < 10 or len(cleaned["title"]) > 200:
+            successful_model = str(result.get("model_used") or "").strip()
+            repair_chain = list(dict.fromkeys(
+                ([successful_model] if successful_model else []) + model_candidates
+            ))
+            repaired = regenerate_title(
+                api_key=api_key,
+                model=repair_chain,
+                title=cleaned["title"],
+                keywords=cleaned["keywords"],
+                max_attempts=2,
+                use_cache=use_cache,
+                operation="auto_title_repair",
+            )
+            result["title_repair"] = repaired
+            if repaired.get("ok") and repaired.get("title"):
+                cleaned["title"] = repaired["title"]
+
+    write_json_atomic(cache_file, result)
+    return result
+
+
+def regenerate_title(
+    *,
+    api_key: str,
+    model: str | Iterable[str],
+    title: str,
+    keywords: list[str],
+    max_attempts: int = TITLE_REPAIR_MAX_ATTEMPTS,
+    use_cache: bool = True,
+    operation: str = "title_repair",
+) -> dict[str, Any]:
+    keywords = parse_keywords(keywords)
+    top10 = keywords[:10]
+    if len(top10) < 10:
+        return {
+            "ok": False,
+            "title": title,
+            "missing": top10,
+            "error": "ต้องมี Keywords อย่างน้อย 10 คำก่อนสร้าง Title ใหม่",
+            "attempts": [],
+            "usage_summary": summarize_usage_events([]),
+        }
+
+    model_candidates = normalize_model_candidates(model)
+    model_signature = json.dumps(model_candidates, ensure_ascii=False)
+    cache_file = cache_path(
+        TITLE_CACHE_DIR,
+        "title",
+        model_signature,
+        title,
+        json.dumps(top10, ensure_ascii=False),
+    )
+    if use_cache:
+        cached = read_json(cache_file)
+        if cached and cached.get("ok"):
+            cached["from_cache"] = True
+            return cached
+
+    client = OpenAI(api_key=api_key, timeout=120.0, max_retries=2)
+    current_title = title.strip()
+    all_attempts: list[dict[str, Any]] = []
+    all_models_tried: list[str] = []
+    current_model_chain = list(model_candidates)
+
+    for repair_index in range(max(1, min(max_attempts, TITLE_REPAIR_MAX_ATTEMPTS))):
+        hybrid = execute_hybrid(
+            client=client,
+            model=current_model_chain,
+            input_payload=build_text_input(title_repair_prompt(current_title, top10)),
+            schema=TitleSchema,
+            fallback_parser=parse_title_text,
+            api_key=api_key,
+            operation=operation,
+            data_validator=title_payload_is_usable,
+            token_ladder=(1000, 1600, 2400),
+        )
+        all_attempts.extend(hybrid.get("attempts", []))
+        all_models_tried.extend(hybrid.get("models_tried", []))
+        successful_model = str(hybrid.get("model_used") or "").strip()
+        if successful_model:
+            current_model_chain = list(dict.fromkeys([successful_model] + current_model_chain))
+        if not hybrid.get("ok"):
+            break
+
+        candidate = str((hybrid.get("data") or {}).get("title") or "").strip().strip('"')
+        if candidate:
+            current_title = candidate
+        coverage = top_keyword_coverage(current_title, top10)
+        if coverage["count"] == 10 and len(current_title) <= 200:
+            output = {
+                "ok": True,
+                "title": current_title,
+                "missing": [],
+                "coverage": 10,
+                "attempts": all_attempts,
+                "repair_rounds": repair_index + 1,
+                "model_used": hybrid.get("model_used"),
+                "models_tried": list(dict.fromkeys(all_models_tried)),
+                "fallback_used": bool(hybrid.get("fallback_used")),
+                "from_cache": False,
+                "usage_summary": summarize_usage_events(
+                    usage_events_from_attempts(all_attempts)
+                ),
+            }
+            write_json_atomic(cache_file, output)
+            return output
+
+    coverage = top_keyword_coverage(current_title, top10)
+    output = {
+        "ok": False,
+        "title": current_title,
+        "missing": coverage["missing"],
+        "coverage": coverage["count"],
+        "attempts": all_attempts,
+        "repair_rounds": min(max_attempts, TITLE_REPAIR_MAX_ATTEMPTS),
+        "model_used": None,
+        "models_tried": list(dict.fromkeys(all_models_tried)),
+        "fallback_used": len(list(dict.fromkeys(all_models_tried))) > 1,
+        "error": "สร้าง Title ใหม่แล้ว แต่ยังไม่ผ่านเงื่อนไขครบทุกข้อ",
+        "from_cache": False,
+        "usage_summary": summarize_usage_events(
+            usage_events_from_attempts(all_attempts)
+        ),
+    }
+    write_json_atomic(cache_file, output)
+    return output
+
+
+def review_metadata(
+    *,
+    original_bytes: bytes,
+    image_sha256: str,
+    api_key: str,
+    model: str | Iterable[str],
+    title: str,
+    keywords: list[str],
+    use_cache: bool = True,
+) -> dict[str, Any]:
+    keywords = parse_keywords(keywords)
+    model_candidates = normalize_model_candidates(model)
+    model_signature = json.dumps(model_candidates, ensure_ascii=False)
+    cache_file = cache_path(
+        QUALITY_CACHE_DIR,
+        "review",
+        image_sha256,
+        model_signature,
+        title,
+        json.dumps(keywords, ensure_ascii=False),
+    )
+    if use_cache:
+        cached = read_json(cache_file)
+        if cached and cached.get("ok"):
+            cached["from_cache"] = True
+            return cached
+
+    data_url, _ = create_analysis_data_url(original_bytes)
+    client = OpenAI(api_key=api_key, timeout=120.0, max_retries=2)
+    hybrid = execute_hybrid(
+        client=client,
+        model=model,
+        input_payload=build_image_input(review_prompt(title, keywords), data_url),
+        schema=ReviewSchema,
+        fallback_parser=parse_review_text,
+        api_key=api_key,
+        operation="ai_review",
+        data_validator=review_payload_is_usable,
+        token_ladder=(1400, 2200, 3200),
+    )
+
+    if not hybrid.get("ok"):
+        return hybrid
+
+    try:
+        review = ReviewSchema.model_validate(hybrid["data"]).model_dump()
+    except Exception:
+        raw = hybrid.get("data") or {}
+        review = {
+            "relevance_score": int(raw.get("relevance_score", 0) or 0),
+            "naturalness_score": int(raw.get("naturalness_score", 0) or 0),
+            "keyword_accuracy_score": int(raw.get("keyword_accuracy_score", 0) or 0),
+            "brand_logo_risk": bool(raw.get("brand_logo_risk", False)),
+            "model_release": str(raw.get("model_release", "uncertain")),
+            "property_release": str(raw.get("property_release", "uncertain")),
+            "issues": [str(item) for item in (raw.get("issues") or [])],
+            "notes": str(raw.get("notes", "")),
+        }
+        for score_key in ("relevance_score", "naturalness_score", "keyword_accuracy_score"):
+            review[score_key] = max(0, min(100, int(review[score_key])))
+
+    output = {
+        "ok": True,
+        "review": review,
+        "attempts": hybrid.get("attempts", []),
+        "method": hybrid.get("method"),
+        "model_used": hybrid.get("model_used"),
+        "models_tried": hybrid.get("models_tried", []),
+        "fallback_used": bool(hybrid.get("fallback_used")),
+        "from_cache": False,
+        "usage_summary": summarize_usage_events(
+            usage_events_from_attempts(hybrid.get("attempts", []))
+        ),
+    }
+    write_json_atomic(cache_file, output)
+    return output
+
+# ========================================================================================
+# Inlined from: app.py
+# ========================================================================================
+
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+import streamlit as st
+
+
+st.set_page_config(
+    page_title=APP_NAME,
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+<style>
+.block-container {padding-top: 1.2rem; padding-bottom: 4rem;}
+[data-testid="stMetricValue"] {font-size: 1.55rem;}
+.small-muted {color: #667085; font-size: 0.9rem;}
+.status-card {padding: 0.8rem 1rem; border: 1px solid #e5e7eb; border-radius: 12px; margin: 0.35rem 0;}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+def init_state() -> None:
+    defaults: dict[str, Any] = {
+        "assets": {},
+        "asset_order": [],
+        "uploader_nonce": 0,
+        "available_models": [],
+        "selected_model_id": AUTO_MODEL_OPTION,
+        "export_bundle": None,
+        "excluded_exports": [],
+        "flash": None,
+        "usd_to_thb": DEFAULT_USD_TO_THB,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def set_flash(level: str, message: str) -> None:
+    st.session_state.flash = {"level": level, "message": message}
+
+
+def show_flash() -> None:
+    flash = st.session_state.pop("flash", None)
+    if not flash:
+        return
+    level = flash.get("level", "info")
+    message = flash.get("message", "")
+    getattr(st, level, st.info)(message)
+
+
+def secret_from_streamlit() -> str:
+    try:
+        return str(st.secrets.get("OPENAI_API_KEY", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def resolve_api_key(manual_key: str) -> tuple[str, str]:
+    manual_key = (manual_key or "").strip()
+    if manual_key:
+        return manual_key, "Manual Input"
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if env_key:
+        return env_key, "Environment Variable"
+    secret_key = secret_from_streamlit()
+    if secret_key:
+        return secret_key, "Streamlit Secrets"
+    return "", "ไม่พบ API Key"
+
+
+def parse_blacklist(text: str) -> list[str]:
+    items = parse_keywords(text)
+    return list(dict.fromkeys(item.casefold().strip() for item in items if item.strip()))
+
+
+def sync_uploaded_files(uploaded_files: list[Any]) -> None:
+    active_assets: dict[str, dict[str, Any]] = {}
+    active_order: list[str] = []
+    existing = st.session_state.assets
+
+    for uploaded in uploaded_files:
+        data = uploaded.getvalue()
+        digest = sha256_bytes(data)
+        name_digest = sha256_bytes(uploaded.name.encode("utf-8"))[:8]
+        asset_id = f"{digest[:20]}_{name_digest}_{Path(uploaded.name).suffix.casefold()}"
+        active_order.append(asset_id)
+
+        if asset_id in existing:
+            record = existing[asset_id]
+            record["filename"] = uploaded.name
+            active_assets[asset_id] = record
+            continue
+
+        try:
+            image_info = inspect_image(data)
+            error = ""
+        except Exception as exc:
+            image_info = {
+                "width": 0,
+                "height": 0,
+                "mode": "unknown",
+                "format": "unknown",
+                "transparency": False,
+                "dpi": None,
+                "has_icc_profile": False,
+            }
+            error = str(exc)
+
+        active_assets[asset_id] = {
+            "id": asset_id,
+            "filename": uploaded.name,
+            "bytes": data,
+            "sha256": digest,
+            "size_bytes": len(data),
+            "mime_type": uploaded.type or "application/octet-stream",
+            "image_info": image_info,
+            "title": "",
+            "keywords": [],
+            "category": "",
+            "releases": "",
+            "analysis_status": "ยังไม่ได้วิเคราะห์" if not error else "ไฟล์มีปัญหา",
+            "error": error,
+            "diagnostics": [],
+            "ai_review": None,
+            "quality": None,
+            "from_cache": False,
+            "model_used": "",
+            "models_tried": [],
+            "fallback_used": False,
+            "review_model_used": "",
+            "api_usage_events": [],
+            "api_usage_summary": summarize_usage_events([]),
+            "cache_usage_reference": [],
+            "ui_revision": 0,
+        }
+
+    if active_order != st.session_state.asset_order:
+        st.session_state.export_bundle = None
+    st.session_state.assets = active_assets
+    st.session_state.asset_order = active_order
+
+
+def friendly_result_error(result: dict[str, Any]) -> str:
+    for attempt in reversed(result.get("attempts", [])):
+        exception = attempt.get("exception") if isinstance(attempt, dict) else None
+        if isinstance(exception, dict) and exception.get("friendly"):
+            detail = exception.get("detail", "")
+            return f"{exception['friendly']}\n\nรายละเอียด: {detail}" if detail else exception["friendly"]
+        if isinstance(attempt, dict) and attempt.get("error_message"):
+            return str(attempt["error_message"])
+        if isinstance(attempt, dict) and attempt.get("incomplete_reason") == "max_output_tokens":
+            return "คำตอบถูกตัดเนื่องจาก max_output_tokens ไม่เพียงพอ"
+        refusals = attempt.get("refusals", []) if isinstance(attempt, dict) else []
+        if refusals:
+            return "โมเดลปฏิเสธคำขอ: " + " | ".join(str(item) for item in refusals)
+    return str(result.get("error") or "ไม่สามารถสร้าง Metadata ได้")
+
+
+def register_result_usage(
+    record: dict[str, Any],
+    result: dict[str, Any] | None,
+    *,
+    usd_to_thb: float,
+    include_title_repair: bool = False,
+) -> None:
+    if not result:
+        return
+
+    if result.get("from_cache"):
+        reference = result.get("usage_summary")
+        if isinstance(reference, dict) and reference.get("api_calls"):
+            record.setdefault("cache_usage_reference", []).append(reference)
+    else:
+        events = usage_events_from_attempts(result.get("attempts", []))
+        record["api_usage_events"] = merge_usage_events(
+            record.get("api_usage_events", []),
+            events,
+        )
+
+    if include_title_repair and not result.get("from_cache"):
+        nested = result.get("title_repair")
+        if isinstance(nested, dict):
+            register_result_usage(
+                record,
+                nested,
+                usd_to_thb=usd_to_thb,
+                include_title_repair=False,
             )
 
-            with image_col:
-                st.image(
-                    payload["bytes"],
-                    use_container_width=True,
-                )
-                st.caption(payload["original_name"])
+    record["api_usage_summary"] = summarize_usage_events(
+        record.get("api_usage_events", []),
+        usd_to_thb,
+    )
 
-                if payload["valid"]:
-                    info = payload["image_info"]
 
-                    st.caption(
-                        f"{info['width']:,} × "
-                        f"{info['height']:,} px • "
-                        f"{info['mode']} • "
-                        f"{human_size(payload['size'])}"
-                    )
+def format_usd(value: float | int | None) -> str:
+    if value is None:
+        return "—"
+    return f"${float(value):.6f}"
 
-                    if info["has_transparency"]:
-                        st.success(
-                            "PNG โปร่งใส — Export คง Alpha"
-                        )
-                else:
-                    st.error(
-                        payload["validation_error"]
-                    )
 
-            with detail_col:
-                if not payload["valid"]:
-                    continue
+def render_api_cost(record: dict[str, Any], usd_to_thb: float) -> None:
+    summary = summarize_usage_events(record.get("api_usage_events", []), usd_to_thb)
+    record["api_usage_summary"] = summary
 
-                file_id = payload["id"]
-                result = st.session_state.results.get(
-                    file_id
-                )
+    st.subheader("API Usage & Cost")
+    cols = st.columns(5)
+    cols[0].metric("API Calls", summary["api_calls"])
+    cols[1].metric("Input Tokens", f"{summary['input_tokens']:,}")
+    cols[2].metric("Cached Input", f"{summary['cached_input_tokens']:,}")
+    cols[3].metric("Output Tokens", f"{summary['output_tokens']:,}")
+    cols[4].metric(
+        "Cost / ภาพ",
+        format_usd(summary["known_cost_usd"]),
+        f"≈ ฿{summary['estimated_cost_thb']:.4f}",
+    )
 
-                if not result:
-                    st.info(
-                        "ยังไม่ได้วิเคราะห์ภาพนี้"
-                    )
-                    continue
+    if summary["unknown_pricing_models"]:
+        st.warning(
+            "มี Token Usage แต่ยังไม่รวมราคาโมเดล: "
+            + ", ".join(summary["unknown_pricing_models"])
+            + " — ระบบจะไม่เดาราคา"
+        )
+    if record.get("from_cache") and not record.get("api_usage_events"):
+        st.info("ผลครั้งนี้มาจาก App Cache จึงไม่มีค่า API เพิ่มใน Session นี้")
+    if record.get("cache_usage_reference"):
+        previous = record["cache_usage_reference"][-1]
+        st.caption(
+            "ผลที่อ่านจาก Cache มีประวัติเดิมประมาณ "
+            f"{previous.get('api_calls', 0)} API calls / "
+            f"{format_usd(previous.get('known_cost_usd', 0.0))} "
+            "แต่ไม่ได้ถูกคิดซ้ำใน Session ปัจจุบัน"
+        )
 
-                if result.get("error"):
-                    st.error(
-                        redact_secrets(
-                            result.get(
-                                "error_message",
-                                "เกิดข้อผิดพลาด",
-                            )
-                        )
-                    )
-
-                    with st.expander("Error detail"):
-                        st.code(
-                            redact_secrets(
-                                result.get("raw", "")
-                            )
-                        )
-
-                title_key = f"title_{file_id}"
-                keywords_key = f"keywords_{file_id}"
-
-                if title_key not in st.session_state:
-                    st.session_state[title_key] = (
-                        result.get("title", "")
-                    )
-
-                if keywords_key not in st.session_state:
-                    st.session_state[keywords_key] = (
-                        result.get("keywords", "")
-                    )
-
-                edited_title = st.text_area(
-                    "Title",
-                    key=title_key,
-                    height=90,
-                )
-
-                edited_keywords = st.text_area(
-                    "Keywords",
-                    key=keywords_key,
-                    height=150,
-                )
-
-                cleaned_title = normalize_title(
-                    edited_title
-                )
-                cleaned_keywords = normalize_keywords(
-                    edited_keywords,
-                    blacklist=[],
-                    limit=999,
-                )
-
-                st.session_state.results[file_id][
-                    "title"
-                ] = cleaned_title
-
-                st.session_state.results[file_id][
-                    "keywords"
-                ] = cleaned_keywords
-
-                button_col1, button_col2, button_col3 = (
-                    st.columns(3)
-                )
-
-                with button_col1:
-                    regenerate_clicked = st.button(
-                        "✨ สร้าง Title ใหม่",
-                        key=f"regenerate_{file_id}",
-                        use_container_width=True,
-                    )
-
-                with button_col2:
-                    quality_clicked = st.button(
-                        "✅ ตรวจคุณภาพใหม่",
-                        key=f"quality_{file_id}",
-                        use_container_width=True,
-                    )
-
-                with button_col3:
-                    delete_result_clicked = st.button(
-                        "🗑️ ลบผลภาพนี้",
-                        key=f"delete_{file_id}",
-                        use_container_width=True,
-                    )
-
-                if regenerate_clicked:
-                    if not api_key:
-                        st.error(
-                            "กรุณาใส่ OpenAI API Key"
-                        )
-                    else:
-                        with st.spinner(
-                            "กำลังสร้างและตรวจ Title ใหม่..."
-                        ):
-                            regenerated = (
-                                regenerate_title_until_valid(
-                                    keywords=cleaned_keywords,
-                                    current_title=cleaned_title,
-                                    api_key=api_key,
-                                    model=model_choice,
-                                    hint=hint,
-                                )
-                            )
-
-                        if regenerated["error"]:
-                            st.error(
-                                redact_secrets(
-                                    regenerated[
-                                        "error_message"
-                                    ]
-                                )
-                            )
-                        else:
-                            new_title = regenerated["title"]
-
-                            st.session_state.results[
-                                file_id
-                            ]["title"] = new_title
-
-                            st.session_state[
-                                title_key
-                            ] = new_title
-
-                            # AI review เก่าหมดอายุ
-                            st.session_state.results[
-                                file_id
-                            ]["ai_review"] = None
-
-                            st.rerun()
-
-                if quality_clicked:
-                    ai_review = None
-
-                    if not api_key:
-                        st.warning(
-                            "ไม่ได้ใส่ API Key: "
-                            "จะตรวจเฉพาะกฎพื้นฐาน"
-                        )
-                    else:
-                        with st.spinner(
-                            "กำลังตรวจความตรงกับภาพ..."
-                        ):
-                            ai_review = ai_quality_review(
-                                image_bytes=payload["bytes"],
-                                title=cleaned_title,
-                                keywords=cleaned_keywords,
-                                api_key=api_key,
-                                model=model_choice,
-                            )
-
-                        if ai_review["error"]:
-                            st.error(
-                                redact_secrets(
-                                    ai_review[
-                                        "error_message"
-                                    ]
-                                )
-                            )
-                            ai_review = None
-
-                    quality = deterministic_quality_check(
-                        title=cleaned_title,
-                        keywords=cleaned_keywords,
-                        blacklist=blacklist,
-                        ai_review=ai_review,
-                    )
-
-                    st.session_state.results[file_id][
-                        "ai_review"
-                    ] = ai_review
-
-                    st.session_state.results[file_id][
-                        "quality"
-                    ] = quality
-
-                    st.rerun()
-
-                if delete_result_clicked:
-                    st.session_state.results.pop(
-                        file_id,
-                        None,
-                    )
-                    st.session_state.pop(
-                        title_key,
-                        None,
-                    )
-                    st.session_state.pop(
-                        keywords_key,
-                        None,
-                    )
-                    st.rerun()
-
-                # คำนวณใหม่ทันทีทุกครั้งที่ผู้ใช้แก้ข้อความ
-                ai_review = result.get("ai_review")
-
-                quality = deterministic_quality_check(
-                    title=cleaned_title,
-                    keywords=cleaned_keywords,
-                    blacklist=blacklist,
-                    ai_review=(
-                        ai_review
-                        if ai_review
-                        and not ai_review.get("error")
+    events = record.get("api_usage_events", [])
+    if events:
+        rows: list[dict[str, Any]] = []
+        for event in events:
+            usage = event.get("usage") or {}
+            cost = event.get("cost") or {}
+            rows.append(
+                {
+                    "Operation": event.get("operation", ""),
+                    "Model": event.get("model", ""),
+                    "Method": event.get("method", ""),
+                    "Input": usage.get("input_tokens", 0),
+                    "Cached": usage.get("cached_input_tokens", 0),
+                    "Output": usage.get("output_tokens", 0),
+                    "Cost USD": (
+                        round(float(cost["total_cost_usd"]), 8)
+                        if cost.get("total_cost_usd") is not None
                         else None
                     ),
-                )
+                }
+            )
+        with st.expander("ดูรายละเอียดค่า API ทุกครั้งที่เรียก"):
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.caption(
+                f"ราคาอ้างอิงในโค้ดอัปเดต {PRICING_UPDATED_AT}; "
+                "ราคาเงินบาทเป็นค่าประมาณตามอัตราที่ตั้งไว้ใน Sidebar"
+            )
 
-                st.session_state.results[file_id][
-                    "quality"
-                ] = quality
 
-                metric1, metric2, metric3, metric4 = (
-                    st.columns(4)
-                )
+def recompute_quality(record: dict[str, Any], blacklist: list[str], ai_threshold: int) -> None:
+    record["keywords"] = parse_keywords(record.get("keywords"))
+    record["quality"] = evaluate_quality(
+        record.get("title", ""),
+        record["keywords"],
+        blacklist,
+        record.get("ai_review"),
+        ai_threshold,
+    )
 
-                metric1.metric(
-                    "Quality Score",
-                    f"{quality['score']}/100",
-                )
-                metric2.metric(
-                    "Keywords",
-                    f"{quality['keyword_count']}/49",
-                )
-                metric3.metric(
-                    "Top 10 ใน Title",
-                    f"{quality['coverage']['count']}/10",
-                )
-                metric4.metric(
-                    "Title Length",
-                    f"{quality['title_length']}/200",
-                )
 
-                if quality["level"] == "success":
-                    st.success(quality["status"])
-                elif quality["level"] == "warning":
-                    st.warning(quality["status"])
+def apply_analysis_result(
+    record: dict[str, Any],
+    result: dict[str, Any],
+    blacklist: list[str],
+    ai_threshold: int,
+    usd_to_thb: float,
+) -> None:
+    register_result_usage(
+        record, result, usd_to_thb=usd_to_thb, include_title_repair=True
+    )
+    record["diagnostics"] = result.get("attempts", [])
+    record["from_cache"] = bool(result.get("from_cache"))
+    record["model_used"] = str(result.get("model_used") or "")
+    record["models_tried"] = list(result.get("models_tried") or [])
+    record["fallback_used"] = bool(result.get("fallback_used"))
+
+    if not result.get("ok"):
+        record["analysis_status"] = "วิเคราะห์ไม่สำเร็จ"
+        record["error"] = friendly_result_error(result)
+        recompute_quality(record, blacklist, ai_threshold)
+        return
+
+    data = result.get("data") or {}
+    record["title"] = str(data.get("title") or "").strip()
+    record["keywords"] = parse_keywords(data.get("keywords"))
+    record["category"] = str(data.get("category") or "").strip()
+    record["releases"] = str(data.get("releases") or "").strip()
+    record["analysis_status"] = "วิเคราะห์แล้ว"
+    record["error"] = ""
+    record["ui_revision"] += 1
+    recompute_quality(record, blacklist, ai_threshold)
+    st.session_state.export_bundle = None
+
+
+def apply_review_result(
+    record: dict[str, Any],
+    result: dict[str, Any],
+    blacklist: list[str],
+    ai_threshold: int,
+    usd_to_thb: float,
+) -> None:
+    register_result_usage(record, result, usd_to_thb=usd_to_thb)
+    if result.get("ok"):
+        record["ai_review"] = result.get("review") or {}
+        record["review_diagnostics"] = result.get("attempts", [])
+        record["review_model_used"] = str(result.get("model_used") or "")
+        record["error"] = ""
+    else:
+        record["error"] = friendly_result_error(result)
+        record["review_diagnostics"] = result.get("attempts", [])
+    recompute_quality(record, blacklist, ai_threshold)
+    st.session_state.export_bundle = None
+
+
+def analyze_worker(
+    asset_id: str,
+    record: dict[str, Any],
+    *,
+    api_key: str,
+    model: list[str],
+    blacklist: list[str],
+    use_cache: bool,
+    auto_review: bool,
+) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+    analysis_result = analyze_image(
+        original_bytes=record["bytes"],
+        image_sha256=record["sha256"],
+        api_key=api_key,
+        model=model,
+        blacklist=blacklist,
+        use_cache=use_cache,
+        auto_repair_title=True,
+    )
+
+    review_result: dict[str, Any] | None = None
+    if auto_review and analysis_result.get("ok"):
+        data = analysis_result.get("data") or {}
+        review_result = review_metadata(
+            original_bytes=record["bytes"],
+            image_sha256=record["sha256"],
+            api_key=api_key,
+            model=model,
+            title=str(data.get("title") or ""),
+            keywords=parse_keywords(data.get("keywords")),
+            use_cache=use_cache,
+        )
+    return asset_id, analysis_result, review_result
+
+
+def run_batch_analysis(
+    asset_ids: list[str],
+    *,
+    api_key: str,
+    model: list[str],
+    blacklist: list[str],
+    use_cache: bool,
+    auto_review: bool,
+    max_workers: int,
+    ai_threshold: int,
+    usd_to_thb: float,
+) -> None:
+    progress = st.progress(0, text="กำลังเตรียมวิเคราะห์ภาพ...")
+    completed = 0
+    success_count = 0
+
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 4))) as executor:
+        futures = {
+            executor.submit(
+                analyze_worker,
+                asset_id,
+                dict(st.session_state.assets[asset_id]),
+                api_key=api_key,
+                model=model,
+                blacklist=blacklist,
+                use_cache=use_cache,
+                auto_review=auto_review,
+            ): asset_id
+            for asset_id in asset_ids
+        }
+
+        for future in as_completed(futures):
+            asset_id = futures[future]
+            record = st.session_state.assets[asset_id]
+            try:
+                _, analysis_result, review_result = future.result()
+                apply_analysis_result(record, analysis_result, blacklist, ai_threshold, usd_to_thb)
+                if review_result is not None:
+                    apply_review_result(record, review_result, blacklist, ai_threshold, usd_to_thb)
+                if analysis_result.get("ok"):
+                    success_count += 1
+            except Exception as exc:
+                error = classify_api_error(exc, api_key)
+                record["analysis_status"] = "วิเคราะห์ไม่สำเร็จ"
+                record["error"] = f"{error['friendly']}\n\nรายละเอียด: {error['detail']}"
+                recompute_quality(record, blacklist, ai_threshold)
+
+            completed += 1
+            progress.progress(
+                completed / len(asset_ids),
+                text=f"วิเคราะห์แล้ว {completed}/{len(asset_ids)} ภาพ",
+            )
+
+    progress.empty()
+    set_flash("success", f"วิเคราะห์สำเร็จ {success_count}/{len(asset_ids)} ภาพ")
+    st.rerun()
+
+
+def status_message(quality: dict[str, Any] | None) -> None:
+    if not quality:
+        st.info("ยังไม่มีผลตรวจคุณภาพ")
+        return
+    status = quality.get("status", "")
+    message = f"{status} — คะแนน {quality.get('score', 0)}/100"
+    if status.startswith("ผ่าน"):
+        st.success(message)
+    elif status.startswith("ไม่ผ่าน"):
+        st.error(message)
+    else:
+        st.warning(message)
+
+
+def render_ai_review(review: dict[str, Any] | None) -> None:
+    if not review:
+        st.caption("ยังไม่ได้ AI Review")
+        return
+    cols = st.columns(3)
+    cols[0].metric("Image relevance", review.get("relevance_score", 0))
+    cols[1].metric("Title naturalness", review.get("naturalness_score", 0))
+    cols[2].metric("Keyword accuracy", review.get("keyword_accuracy_score", 0))
+    st.caption(
+        f"Brand/Logo risk: {'พบความเสี่ยง' if review.get('brand_logo_risk') else 'ไม่พบชัดเจน'} · "
+        f"Model release: {review.get('model_release', 'uncertain')} · "
+        f"Property release: {review.get('property_release', 'uncertain')}"
+    )
+    if review.get("issues"):
+        st.warning("AI Issues: " + " | ".join(str(item) for item in review["issues"]))
+    if review.get("notes"):
+        st.caption(str(review["notes"]))
+
+
+def render_asset(
+    record: dict[str, Any],
+    *,
+    api_key: str,
+    model: list[str],
+    blacklist: list[str],
+    use_cache: bool,
+    ai_threshold: int,
+    show_debug: bool,
+    usd_to_thb: float,
+) -> None:
+    asset_id = record["id"]
+    revision = record.get("ui_revision", 0)
+    info = record["image_info"]
+
+    with st.expander(f"{record['filename']} — {record['analysis_status']}", expanded=True):
+        preview_col, form_col = st.columns([0.9, 1.8], gap="large")
+
+        with preview_col:
+            st.image(record["bytes"], use_container_width=True)
+            st.markdown(
+                f"""
+<div class="small-muted">
+<b>ไฟล์:</b> {record['filename']}<br>
+<b>ขนาด:</b> {human_bytes(record['size_bytes'])}<br>
+<b>มิติ:</b> {info['width']} × {info['height']} px<br>
+<b>Mode:</b> {info['mode']} · <b>Format:</b> {info['format']}<br>
+<b>Transparency:</b> {'Yes' if info['transparency'] else 'No'}<br>
+<b>ICC Profile:</b> {'Yes' if info['has_icc_profile'] else 'No'}
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+            if record.get("from_cache"):
+                st.caption("ผลวิเคราะห์นี้โหลดจาก Cache")
+            if record.get("model_used"):
+                st.caption(f"โมเดลที่สร้าง Metadata จริง: {record['model_used']}")
+            if record.get("fallback_used") and record.get("models_tried"):
+                st.info("มีการสลับโมเดลอัตโนมัติ: " + " → ".join(record["models_tried"]))
+
+        with form_col:
+            title_key = f"title_{asset_id}_{revision}"
+            keywords_key = f"keywords_{asset_id}_{revision}"
+            category_key = f"category_{asset_id}_{revision}"
+            releases_key = f"releases_{asset_id}_{revision}"
+
+            new_title = st.text_area(
+                "Title",
+                value=record.get("title", ""),
+                height=100,
+                key=title_key,
+                help="ต้องไม่เกิน 200 ตัวอักษร และต้องมี Keywords 10 คำแรกครบ",
+            )
+            new_keywords_text = st.text_area(
+                "Keywords — คั่นด้วย comma หรือขึ้นบรรทัดใหม่",
+                value=", ".join(parse_keywords(record.get("keywords"))),
+                height=150,
+                key=keywords_key,
+            )
+            small_cols = st.columns(2)
+            new_category = small_cols[0].text_input(
+                "Category",
+                value=record.get("category", ""),
+                key=category_key,
+            )
+            new_releases = small_cols[1].text_input(
+                "Releases",
+                value=record.get("releases", ""),
+                key=releases_key,
+            )
+
+            parsed_new_keywords = parse_keywords(new_keywords_text)
+            changed = (
+                new_title != record.get("title", "")
+                or parsed_new_keywords != parse_keywords(record.get("keywords"))
+                or new_category != record.get("category", "")
+                or new_releases != record.get("releases", "")
+            )
+            record["title"] = new_title
+            record["keywords"] = parsed_new_keywords
+            record["category"] = new_category
+            record["releases"] = new_releases
+            if changed:
+                st.session_state.export_bundle = None
+            recompute_quality(record, blacklist, ai_threshold)
+
+            quality = record["quality"]
+            metrics = st.columns(4)
+            metrics[0].metric("Keywords", f"{quality['keyword_count']}/49")
+            metrics[1].metric("Top 10 Coverage", f"{quality['top10_coverage']}/10")
+            metrics[2].metric("Title Length", f"{quality['title_length']}/200")
+            metrics[3].metric("Quality Score", f"{quality['score']}/100")
+            status_message(quality)
+
+            if quality["missing_keywords"]:
+                st.error("Missing Keywords: " + ", ".join(quality["missing_keywords"]))
+            if quality["issues"]:
+                st.caption("Issues: " + " | ".join(quality["issues"]))
+            if quality["warnings"]:
+                st.caption("Warnings: " + " | ".join(quality["warnings"]))
+
+            action_cols = st.columns(4)
+            analyze_clicked = action_cols[0].button(
+                "วิเคราะห์ภาพนี้",
+                key=f"analyze_{asset_id}",
+                use_container_width=True,
+            )
+            regenerate_clicked = action_cols[1].button(
+                "สร้าง Title ใหม่",
+                key=f"regenerate_{asset_id}",
+                use_container_width=True,
+            )
+            check_clicked = action_cols[2].button(
+                "ตรวจด้วยกฎ",
+                key=f"rulecheck_{asset_id}",
+                use_container_width=True,
+            )
+            ai_review_clicked = action_cols[3].button(
+                "AI Review",
+                key=f"aireview_{asset_id}",
+                use_container_width=True,
+            )
+
+            if analyze_clicked:
+                if not api_key:
+                    st.error("กรุณาใส่ OpenAI API Key ก่อนวิเคราะห์")
+                elif record.get("error") and info.get("width", 0) == 0:
+                    st.error(record["error"])
                 else:
-                    st.error(quality["status"])
+                    with st.spinner("กำลังวิเคราะห์ภาพและสร้าง Metadata..."):
+                        result = analyze_image(
+                            original_bytes=record["bytes"],
+                            image_sha256=record["sha256"],
+                            api_key=api_key,
+                            model=model,
+                            blacklist=blacklist,
+                            use_cache=use_cache,
+                            auto_repair_title=True,
+                        )
+                    apply_analysis_result(record, result, blacklist, ai_threshold, usd_to_thb)
+                    set_flash("success" if result.get("ok") else "error", "วิเคราะห์ภาพเสร็จแล้ว" if result.get("ok") else record["error"])
+                    st.rerun()
 
-                with st.expander(
-                    "🔎 รายละเอียดการตรวจคุณภาพ",
-                    expanded=(
-                        quality["level"] != "success"
-                    ),
-                ):
-                    st.markdown("**10 Keywords แรก**")
-                    st.write(
-                        ", ".join(
-                            quality["coverage"][
-                                "top_ten"
-                            ]
+            if regenerate_clicked:
+                if not api_key:
+                    st.error("กรุณาใส่ OpenAI API Key ก่อนสร้าง Title ใหม่")
+                else:
+                    with st.spinner("กำลังเรียบเรียง Title ใหม่จาก Keywords 10 คำแรก..."):
+                        result = regenerate_title(
+                            api_key=api_key,
+                            model=model,
+                            title=record.get("title", ""),
+                            keywords=record.get("keywords", []),
+                            max_attempts=3,
+                            use_cache=use_cache,
+                            operation="manual_title_regeneration",
                         )
-                        or "-"
-                    )
-
-                    st.markdown(
-                        "**พบใน Title แบบตรงคำ**"
-                    )
-                    st.write(
-                        ", ".join(
-                            quality["coverage"][
-                                "found"
-                            ]
-                        )
-                        or "-"
-                    )
-
-                    st.markdown(
-                        "**คำที่ยังขาดจาก Title**"
-                    )
-                    st.write(
-                        ", ".join(
-                            quality["coverage"][
-                                "missing"
-                            ]
-                        )
-                        or "ไม่มี — ครบ 10/10"
-                    )
-
-                    st.markdown("**คะแนนแยกส่วน**")
-                    breakdown_df = pd.DataFrame([
-                        {
-                            "หัวข้อ": key,
-                            "คะแนน": value,
-                        }
-                        for key, value in (
-                            quality[
-                                "score_breakdown"
-                            ].items()
-                        )
-                    ])
-
-                    st.dataframe(
-                        breakdown_df,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                    if quality["issues"]:
-                        st.markdown(
-                            "**สิ่งที่ต้องแก้**"
-                        )
-                        for issue in quality["issues"]:
-                            st.write(f"• {issue}")
-
-                    if (
-                        quality["ai_relevance"]
-                        is not None
-                    ):
-                        st.markdown(
-                            "**AI Quality Review**"
-                        )
-                        st.write(
-                            "ความตรงภาพ: "
-                            f"{quality['ai_relevance']}/10"
-                        )
-                        st.write(
-                            "ความเป็นธรรมชาติ: "
-                            f"{quality['ai_naturalness']}/10"
-                        )
-                        st.write(
-                            "ความแม่นยำ Keywords: "
-                            f"{quality['ai_keyword_accuracy']}/10"
-                        )
-
-                        for note in quality["ai_notes"]:
-                            st.write(f"• {note}")
+                    register_result_usage(record, result, usd_to_thb=usd_to_thb)
+                    record["diagnostics"] = result.get("attempts", [])
+                    if result.get("model_used"):
+                        record["model_used"] = str(result.get("model_used"))
+                    record["models_tried"] = list(result.get("models_tried") or record.get("models_tried") or [])
+                    record["fallback_used"] = bool(result.get("fallback_used"))
+                    if result.get("title"):
+                        record["title"] = result["title"]
+                        record["ui_revision"] += 1
+                    record["error"] = "" if result.get("ok") else str(result.get("error") or "")
+                    recompute_quality(record, blacklist, ai_threshold)
+                    st.session_state.export_bundle = None
+                    if result.get("ok"):
+                        set_flash("success", "สร้าง Title ใหม่สำเร็จ และ Top 10 Coverage ครบ 10/10")
                     else:
-                        st.info(
-                            "ยังไม่มี AI Review "
-                            "กด “ตรวจคุณภาพใหม่” "
-                            "เพื่อตรวจความตรงกับภาพ"
-                        )
+                        missing = ", ".join(result.get("missing", []))
+                        set_flash("warning", f"ยังไม่ผ่าน คำที่ขาด: {missing or 'ไม่ทราบ'}")
+                    st.rerun()
 
-                export_allowed = (
-                    quality["level"] == "success"
-                    or not prevent_failed_export
-                )
+            if check_clicked:
+                recompute_quality(record, blacklist, ai_threshold)
+                set_flash("success" if record["quality"]["hard_pass"] else "warning", record["quality"]["status"])
+                st.rerun()
 
-                if export_allowed:
-                    final_items.append({
-                        "File ID": file_id,
-                        "Filename": payload["safe_name"],
-                        "Title": cleaned_title,
-                        "Keywords": cleaned_keywords,
-                        "Category": category_num,
-                        "Releases": "",
-                        "Quality Score": quality["score"],
-                        "Quality Status": quality["status"],
-                        "Top 10 Coverage": (
-                            quality["coverage"]["count"]
-                        ),
-                        "bytes": payload["bytes"],
-                        "extension": payload["extension"],
-                    })
+            if ai_review_clicked:
+                if not api_key:
+                    st.error("กรุณาใส่ OpenAI API Key ก่อนใช้ AI Review")
+                elif not record.get("title") or not record.get("keywords"):
+                    st.error("ต้องมี Title และ Keywords ก่อนใช้ AI Review")
                 else:
-                    failed_items.append(
-                        payload["original_name"]
+                    with st.spinner("กำลังตรวจความตรงของ Metadata กับภาพ..."):
+                        result = review_metadata(
+                            original_bytes=record["bytes"],
+                            image_sha256=record["sha256"],
+                            api_key=api_key,
+                            model=model,
+                            title=record["title"],
+                            keywords=record["keywords"],
+                            use_cache=use_cache,
+                        )
+                    apply_review_result(record, result, blacklist, ai_threshold, usd_to_thb)
+                    set_flash("success" if result.get("ok") else "error", "AI Review สำเร็จ" if result.get("ok") else record["error"])
+                    st.rerun()
+
+            st.divider()
+            render_api_cost(record, usd_to_thb)
+            st.divider()
+            st.subheader("AI Review")
+            render_ai_review(record.get("ai_review"))
+            if record.get("review_model_used"):
+                st.caption(f"โมเดลที่ใช้ AI Review จริง: {record['review_model_used']}")
+
+            if record.get("error"):
+                st.error(record["error"])
+
+            if show_debug and (record.get("diagnostics") or record.get("review_diagnostics")):
+                with st.expander("Technical diagnostics / Raw response"):
+                    st.json(
+                        {
+                            "analysis": record.get("diagnostics", []),
+                            "review": record.get("review_diagnostics", []),
+                        },
+                        expanded=False,
                     )
 
-    # =====================================================
-    # 14) EXPORT
-    # =====================================================
-    if failed_items and prevent_failed_export:
+
+init_state()
+show_flash()
+
+st.title("🧠 AI Stock Vision V2.4 — Single File")
+st.caption(
+    "สร้าง Adobe Stock Title + 49 Keywords พร้อมตรวจคุณภาพ ติดตาม Token/ค่า API ต่อภาพ และ Export CSV/ZIP"
+)
+
+with st.sidebar:
+    st.header("OpenAI Settings")
+    manual_api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-...",
+        help="ไม่ถูกบันทึกลง CSV, Cache หรือ Log",
+    )
+    api_key, api_key_source = resolve_api_key(manual_api_key)
+    st.caption(f"API Key source: {api_key_source}")
+
+    if st.button("รีเฟรชรายการโมเดล", use_container_width=True):
+        if not api_key:
+            st.error("กรุณาใส่ API Key ก่อน")
+        else:
+            try:
+                with st.spinner("กำลังอ่านรายชื่อโมเดลที่ API Key เข้าถึงได้..."):
+                    models = discover_models(api_key)
+                st.session_state.available_models = models
+                st.session_state.selected_model_id = AUTO_MODEL_OPTION
+                st.success(f"พบโมเดลที่มีแนวโน้มรองรับงานนี้ {len(models)} โมเดล")
+                if USER_REQUESTED_MODEL_ID in models:
+                    st.info(f"บัญชีนี้มองเห็น {USER_REQUESTED_MODEL_ID} และสามารถเลือกใช้ได้")
+                else:
+                    st.warning(
+                        f"ไม่พบ {USER_REQUESTED_MODEL_ID} ในรายการของ API Key นี้ "
+                        "ระบบจะไม่ฝืนเรียกชื่อโมเดลที่ไม่มีจริง และจะเลือกตัวที่ดีที่สุดแทน"
+                    )
+            except Exception as exc:
+                error = classify_api_error(exc, api_key)
+                st.error(f"{error['friendly']}\n\n{error['detail']}")
+
+    models = st.session_state.available_models
+    model_options = [AUTO_MODEL_OPTION] + models
+    if st.session_state.selected_model_id not in model_options:
+        st.session_state.selected_model_id = AUTO_MODEL_OPTION
+    selected_index = model_options.index(st.session_state.selected_model_id)
+    selected_model = st.selectbox(
+        "Model",
+        model_options,
+        index=selected_index,
+        format_func=lambda value: (
+            "Auto — เลือกโมเดลคุณภาพสูงสุดที่ใช้งานได้"
+            if value == AUTO_MODEL_OPTION
+            else value
+        ),
+        help="โหมด Auto จะใช้รายการจาก client.models.list() และสลับไปโมเดลสำรองเมื่อโมเดลแรกใช้ไม่ได้",
+    )
+    st.session_state.selected_model_id = selected_model
+    custom_model = st.text_input(
+        "Custom Model ID",
+        placeholder="เช่น gpt-4.1 หรือ gpt-4.6 — ระบบจะลองแล้ว fallback ให้อัตโนมัติ",
+    )
+    auto_model_fallback = st.checkbox(
+        "สลับไปโมเดลสำรองอัตโนมัติ",
+        value=True,
+        help="หากโมเดลไม่พบ ไม่รองรับภาพ ไม่รองรับ Structured Output หรือให้ผลลัพธ์ใช้ไม่ได้ ระบบจะลองตัวถัดไป",
+    )
+
+    requested_model = custom_model.strip() or selected_model
+    effective_models = build_model_fallback_chain(
+        models,
+        selected_model=requested_model,
+        auto_fallback=auto_model_fallback,
+    )
+    if effective_models:
+        st.caption(f"โมเดลหลัก: {effective_models[0]}")
+        if len(effective_models) > 1:
+            preview = " → ".join(effective_models[:6])
+            suffix = " → …" if len(effective_models) > 6 else ""
+            st.caption(f"Fallback chain: {preview}{suffix}")
+
+    if custom_model.strip() == USER_REQUESTED_MODEL_ID and models and USER_REQUESTED_MODEL_ID not in models:
         st.warning(
-            "ภาพที่ยังไม่ผ่านและถูกกันออกจาก Export: "
-            + ", ".join(failed_items)
+            f"API Key นี้ไม่พบ {USER_REQUESTED_MODEL_ID}; ระบบจะลองตามคำขอหนึ่งครั้งแล้วสลับไปตัวที่ใช้งานได้"
+        )
+    if not models:
+        st.warning(
+            f"ยังไม่ได้ดึงรายการโมเดล ระบบจะลอง {DEFAULT_MODEL_ID} ก่อน "
+            "แล้วถอยไป gpt-4.1 และ gpt-4o อัตโนมัติ"
         )
 
-    if final_items:
-        st.divider()
-        st.subheader("📦 Export")
+    st.divider()
+    st.header("Processing")
+    usd_to_thb = st.number_input(
+        "อัตรา USD → THB สำหรับประมาณการ",
+        min_value=0.0,
+        max_value=100.0,
+        value=float(st.session_state.usd_to_thb),
+        step=0.10,
+        help="ค่า API จริงคำนวณเป็น USD; ค่าเงินบาทเป็นเพียงประมาณการ",
+    )
+    st.session_state.usd_to_thb = usd_to_thb
+    max_workers = st.slider("จำนวนภาพที่ทำพร้อมกัน", 1, 4, 2)
+    use_cache = st.checkbox("ใช้ผล Cache เมื่อข้อมูลตรงกัน", value=True)
+    auto_review = st.checkbox("ทำ AI Review อัตโนมัติหลังวิเคราะห์", value=False)
+    only_pending = st.checkbox("วิเคราะห์เฉพาะภาพที่ยังไม่มีผล", value=True)
+    ai_threshold = st.slider(
+        "เกณฑ์ AI Review สำหรับ Export",
+        0,
+        100,
+        DEFAULT_AI_REVIEW_THRESHOLD,
+        5,
+    )
+    block_failed_export = st.checkbox("ไม่ให้ Export ภาพที่ไม่ผ่านคุณภาพ", value=True)
+    show_debug = st.checkbox("แสดง Technical diagnostics", value=False)
 
-        adobe_df = pd.DataFrame(final_items)[[
-            "Filename",
-            "Title",
-            "Keywords",
-            "Category",
-            "Releases",
-        ]]
+    st.divider()
+    st.header("Blacklist")
+    blacklist_text = st.text_area(
+        "หนึ่งคำต่อบรรทัด หรือคั่นด้วย comma",
+        value="\n".join(sorted(DEFAULT_BLACKLIST)),
+        height=220,
+    )
+    blacklist = parse_blacklist(blacklist_text)
 
-        quality_df = pd.DataFrame(final_items)[[
-            "Filename",
-            "Quality Score",
-            "Quality Status",
-            "Top 10 Coverage",
-        ]]
+st.subheader("1. อัปโหลดภาพ")
+uploaded_files = st.file_uploader(
+    "รองรับ JPG, JPEG และ PNG — เลือกได้หลายภาพ",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True,
+    key=f"uploader_{st.session_state.uploader_nonce}",
+)
+sync_uploaded_files(uploaded_files or [])
 
-        csv_bytes = adobe_df.to_csv(
-            index=False
-        ).encode("utf-8-sig")
+reset_col, cache_col, cache_confirm_col = st.columns([1, 1.25, 1.2])
+with reset_col:
+    if st.button("ล้างภาพออกจากหน้าอัปโหลด", use_container_width=True):
+        st.session_state.assets = {}
+        st.session_state.asset_order = []
+        st.session_state.export_bundle = None
+        st.session_state.excluded_exports = []
+        st.session_state.uploader_nonce += 1
+        set_flash("success", "ล้างภาพและข้อมูลใน Session ปัจจุบันแล้ว")
+        st.rerun()
 
-        quality_csv_bytes = quality_df.to_csv(
-            index=False
-        ).encode("utf-8-sig")
-
-        export_col1, export_col2 = st.columns(2)
-
-        with export_col1:
-            st.download_button(
-                "📊 Download Adobe CSV",
-                data=csv_bytes,
-                file_name="adobe_stock_metadata.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-        with export_col2:
-            create_zip_clicked = st.button(
-                "📦 สร้าง ZIP พร้อม Metadata",
-                use_container_width=True,
-            )
-
-        if create_zip_clicked:
-            zip_buffer = io.BytesIO()
-
-            with zipfile.ZipFile(
-                zip_buffer,
-                "w",
-                zipfile.ZIP_DEFLATED,
-            ) as archive:
-                archive.writestr(
-                    "adobe_stock_metadata.csv",
-                    csv_bytes,
-                )
-                archive.writestr(
-                    "metadata_quality_report.csv",
-                    quality_csv_bytes,
-                )
-
-                used_names: Dict[str, int] = {}
-
-                for item in final_items:
-                    filename = item["Filename"]
-                    filename_key = filename.lower()
-                    occurrence = (
-                        used_names.get(
-                            filename_key,
-                            0,
-                        )
-                        + 1
-                    )
-                    used_names[filename_key] = occurrence
-
-                    if occurrence > 1:
-                        path = Path(filename)
-                        filename = (
-                            f"{path.stem}_{occurrence}"
-                            f"{path.suffix}"
-                        )
-
-                    exported = export_image(
-                        data=item["bytes"],
-                        extension=item["extension"],
-                        title=item["Title"],
-                        keywords=item["Keywords"],
-                    )
-
-                    archive.writestr(
-                        filename,
-                        exported,
-                    )
-
-            zip_bytes = zip_buffer.getvalue()
-            export_name = (
-                f"adobe_stock_package_"
-                f"{int(time.time())}.zip"
-            )
-
-            export_path = (
-                EXPORT_CACHE_DIR / export_name
-            )
-            export_path.write_bytes(zip_bytes)
-
-            st.session_state.generated_zip = (
-                zip_bytes
-            )
-            st.session_state.generated_zip_name = (
-                export_name
-            )
-
-        if st.session_state.generated_zip:
-            st.download_button(
-                "📂 Download ZIP",
-                data=st.session_state.generated_zip,
-                file_name=(
-                    st.session_state
-                    .generated_zip_name
-                ),
-                mime="application/zip",
-                type="primary",
-                use_container_width=True,
-            )
-
-        with st.expander("ดู Adobe CSV"):
-            st.dataframe(
-                adobe_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with st.expander(
-            "ดู Quality Report"
-        ):
-            st.dataframe(
-                quality_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-except Exception:
-    st.error("Application Error")
-
-    with st.expander(
-        "รายละเอียด Error",
-        expanded=True,
+with cache_confirm_col:
+    confirm_clear_cache = st.checkbox("ยืนยันล้าง Server Cache", value=False)
+with cache_col:
+    if st.button(
+        "ล้างแคชภาพทั้งหมดบนเซิร์ฟเวอร์",
+        disabled=not confirm_clear_cache,
+        use_container_width=True,
     ):
-        st.code(
-            redact_secrets(
-                traceback.format_exc()
+        try:
+            file_count, bytes_removed = clear_app_cache()
+            st.session_state.export_bundle = None
+            set_flash("success", f"ลบ {file_count} ไฟล์ คืนพื้นที่ {human_bytes(bytes_removed)}")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+assets = st.session_state.assets
+asset_order = st.session_state.asset_order
+
+if not asset_order:
+    st.info("อัปโหลดภาพเพื่อเริ่มใช้งาน")
+    st.stop()
+
+st.subheader("2. วิเคราะห์ภาพ")
+summary_cols = st.columns(4)
+summary_cols[0].metric("จำนวนภาพ", len(asset_order))
+summary_cols[1].metric(
+    "วิเคราะห์แล้ว",
+    sum(assets[asset_id]["analysis_status"] == "วิเคราะห์แล้ว" for asset_id in asset_order),
+)
+summary_cols[2].metric(
+    "พร้อม Export",
+    sum(
+        bool((assets[asset_id].get("quality") or {}).get("export_eligible"))
+        for asset_id in asset_order
+    ),
+)
+summary_cols[3].metric(
+    "ขนาดรวม",
+    human_bytes(sum(assets[asset_id]["size_bytes"] for asset_id in asset_order)),
+)
+
+all_session_events: list[dict[str, Any]] = []
+for asset_id in asset_order:
+    all_session_events.extend(assets[asset_id].get("api_usage_events", []))
+session_usage = summarize_usage_events(all_session_events, usd_to_thb)
+usage_cols = st.columns(4)
+usage_cols[0].metric("API Calls รวม", session_usage["api_calls"])
+usage_cols[1].metric("Input Tokens รวม", f"{session_usage['input_tokens']:,}")
+usage_cols[2].metric("Output Tokens รวม", f"{session_usage['output_tokens']:,}")
+usage_cols[3].metric(
+    "ค่า API รวม Session",
+    format_usd(session_usage["known_cost_usd"]),
+    f"≈ ฿{session_usage['estimated_cost_thb']:.4f}",
+)
+if session_usage["unknown_pricing_models"]:
+    st.warning(
+        "ยอดรวมยังไม่รวมโมเดลที่ไม่มีราคาในตาราง: "
+        + ", ".join(session_usage["unknown_pricing_models"])
+    )
+
+batch_col, export_col = st.columns([1.2, 1])
+with batch_col:
+    if st.button("วิเคราะห์ภาพทั้งหมด", type="primary", use_container_width=True):
+        if not api_key:
+            st.error("กรุณาใส่ OpenAI API Key ก่อนวิเคราะห์")
+        else:
+            target_ids = [
+                asset_id
+                for asset_id in asset_order
+                if not only_pending or assets[asset_id]["analysis_status"] != "วิเคราะห์แล้ว"
+            ]
+            target_ids = [
+                asset_id
+                for asset_id in target_ids
+                if assets[asset_id]["image_info"].get("width", 0) > 0
+            ]
+            if not target_ids:
+                st.info("ไม่มีภาพที่ต้องวิเคราะห์ตามเงื่อนไขปัจจุบัน")
+            else:
+                run_batch_analysis(
+                    target_ids,
+                    api_key=api_key,
+                    model=effective_models,
+                    blacklist=blacklist,
+                    use_cache=use_cache,
+                    auto_review=auto_review,
+                    max_workers=max_workers,
+                    ai_threshold=ai_threshold,
+                    usd_to_thb=usd_to_thb,
+                )
+
+with export_col:
+    if st.button("เตรียมไฟล์ CSV และ ZIP", use_container_width=True):
+        selected_records: list[dict[str, Any]] = []
+        excluded: list[str] = []
+        for asset_id in asset_order:
+            record = assets[asset_id]
+            recompute_quality(record, blacklist, ai_threshold)
+            record["api_usage_summary"] = summarize_usage_events(
+                record.get("api_usage_events", []), usd_to_thb
             )
-        )
+            if block_failed_export and not record["quality"]["export_eligible"]:
+                excluded.append(record["filename"])
+            else:
+                selected_records.append(record)
+
+        st.session_state.excluded_exports = excluded
+        if not selected_records:
+            st.error("ไม่มีไฟล์ที่ผ่านเงื่อนไขสำหรับ Export")
+        else:
+            try:
+                with st.spinner("กำลังฝัง Metadata และสร้างไฟล์ ZIP..."):
+                    st.session_state.export_bundle = build_export_zip(selected_records)
+                st.success(f"เตรียม Export แล้ว {len(selected_records)} ภาพ")
+            except Exception as exc:
+                st.error(f"สร้างไฟล์ Export ไม่สำเร็จ: {type(exc).__name__}: {exc}")
+
+if st.session_state.excluded_exports:
+    st.warning("ไฟล์ที่ถูกกันออก: " + ", ".join(st.session_state.excluded_exports))
+
+bundle = st.session_state.export_bundle
+if bundle:
+    download_cols = st.columns(4)
+    download_cols[0].download_button(
+        "ดาวน์โหลด Adobe CSV",
+        data=bundle["adobe_csv"],
+        file_name="adobe_stock_metadata.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    download_cols[1].download_button(
+        "ดาวน์โหลด Quality Report CSV",
+        data=bundle["quality_csv"],
+        file_name="quality_report.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    download_cols[2].download_button(
+        "ดาวน์โหลด API Cost CSV",
+        data=bundle["api_cost_csv"],
+        file_name="api_cost_report.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    download_cols[3].download_button(
+        "ดาวน์โหลด ZIP พร้อมภาพ",
+        data=bundle["zip_bytes"],
+        file_name=bundle["filename"],
+        mime="application/zip",
+        use_container_width=True,
+    )
+    if bundle.get("warnings"):
+        with st.expander("Export warnings"):
+            for warning in bundle["warnings"]:
+                st.warning(warning)
+
+st.divider()
+st.subheader("3. ตรวจและแก้รายภาพ")
+for current_asset_id in asset_order:
+    render_asset(
+        assets[current_asset_id],
+        api_key=api_key,
+        model=effective_models,
+        blacklist=blacklist,
+        use_cache=use_cache,
+        ai_threshold=ai_threshold,
+        show_debug=show_debug,
+        usd_to_thb=usd_to_thb,
+    )

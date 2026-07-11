@@ -1,0 +1,22 @@
+AI Stock Vision V2.4 — Single File
+Validation date: 2026-07-11
+
+ผลตรวจสอบ
+- Python syntax: PASS
+- Streamlit health check: PASS
+- Streamlit AppTest initial render: PASS (0 exceptions)
+- Top 10 keyword coverage: PASS
+- Quality rule engine: PASS
+- JSON block parser: PASS
+- PNG metadata embedding and image verification: PASS
+- JPEG IPTC Title and 49 Keywords read-back: PASS
+- ZIP contains image, Adobe CSV, Quality CSV and API Cost CSV: PASS
+- Model fallback chain including requested gpt-4.6 -> available model: PASS
+- Per-response token and cost calculation: PASS
+
+ไม่ได้ทดสอบ
+- การเรียก OpenAI API จริง เพราะไม่มี API Key ของผู้ใช้ในระบบทดสอบ
+
+หมายเหตุ
+- API Key ต้องใส่ผ่านช่อง Password, Environment Variable หรือ Streamlit Secrets
+- ระบบจะไม่เดาราคาโมเดลที่ไม่มีอยู่ในตารางราคา

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-AI Stock Vision V2.6 — Boot-safe single-file Streamlit application
+AI Stock Vision V2.7 — Metadata-safe single-file Streamlit application
 
 Run:
     pip install -r requirements.txt
@@ -23,8 +23,8 @@ import traceback
 # inside the app instead of only displaying Community Cloud's generic "Oh no" page.
 import streamlit as st
 
-APP_NAME = "AI Stock Vision V2.6 — Boot Safe"
-PROMPT_VERSION = "v2.6.0-boot-safe"
+APP_NAME = "AI Stock Vision V2.7 — Metadata Safe"
+PROMPT_VERSION = "v2.7.0-metadata-safe"
 ANALYSIS_MAX_LONG_EDGE = 1800
 TOKEN_LADDER = (2400, 3600, 5000)
 TITLE_REPAIR_MAX_ATTEMPTS = 3
@@ -960,20 +960,105 @@ def embed_jpeg_iptc(original_bytes: bytes, suffix: str, title: str, keywords: li
         return output_path.read_bytes()
 
 
+def detect_actual_image_format(original_bytes: bytes, record: dict[str, Any] | None = None) -> str:
+    """Detect the real image container from bytes, not only the filename suffix."""
+    if original_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "PNG"
+    if original_bytes.startswith(b"\xff\xd8\xff"):
+        return "JPEG"
+    if record:
+        detected = str((record.get("image_info") or {}).get("format") or "").upper().strip()
+        if detected in {"PNG", "JPEG", "JPG"}:
+            return "JPEG" if detected == "JPG" else detected
+    try:
+        with Image.open(io.BytesIO(original_bytes)) as image:
+            detected = str(image.format or "").upper().strip()
+            return "JPEG" if detected == "JPG" else detected
+    except Exception:
+        return ""
+
+
+def corrected_export_filename(filename: str, original_bytes: bytes, record: dict[str, Any] | None = None) -> tuple[str, str | None]:
+    """Keep the basename but correct a misleading extension when the bytes prove another format."""
+    actual = detect_actual_image_format(original_bytes, record)
+    path = Path(filename)
+    suffix = path.suffix.casefold()
+    expected = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG"}.get(suffix)
+    if actual == "PNG" and expected != "PNG":
+        return f"{path.stem}.png", f"ชื่อไฟล์เดิมเป็น {suffix or '(ไม่มีนามสกุล)'} แต่ข้อมูลจริงเป็น PNG จึงแก้นามสกุลเป็น .png เพื่อให้ Metadata และโปรแกรม Adobe อ่านได้ถูกต้อง"
+    if actual == "JPEG" and expected != "JPEG":
+        return f"{path.stem}.jpg", f"ชื่อไฟล์เดิมเป็น {suffix or '(ไม่มีนามสกุล)'} แต่ข้อมูลจริงเป็น JPEG จึงแก้นามสกุลเป็น .jpg"
+    return filename, None
+
+
+def verify_embedded_metadata(image_bytes: bytes, actual_format: str, title: str, keywords: list[str]) -> tuple[bool, str]:
+    """Verify that metadata was actually written before the image is placed in ZIP."""
+    try:
+        if actual_format == "PNG":
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                image.load()  # parse ancillary chunks that may appear after IDAT
+                info = dict(image.info)
+                found_title = str(info.get("Title") or info.get("Description") or "").strip()
+                found_keywords = str(info.get("Keywords") or "").strip()
+            missing = []
+            if title and found_title != title:
+                missing.append("Title")
+            expected_keywords = [k.casefold() for k in keywords]
+            found_list = [k.strip().casefold() for k in found_keywords.split(",") if k.strip()]
+            if expected_keywords and not all(k in found_list for k in expected_keywords):
+                missing.append("Keywords")
+            if missing:
+                return False, "ตรวจหลังฝังแล้วไม่พบ " + ", ".join(missing)
+            return True, ""
+
+        if actual_format == "JPEG":
+            try:
+                from iptcinfo3 import IPTCInfo
+            except ImportError as exc:
+                return False, f"ไม่สามารถตรวจ IPTC ได้: {exc}"
+            with tempfile.TemporaryDirectory(prefix="ai_stock_vision_verify_") as temp_dir:
+                path = Path(temp_dir) / "verify.jpg"
+                path.write_bytes(image_bytes)
+                info = IPTCInfo(str(path), force=True, inp_charset="utf8", out_charset="utf8")
+                def _decode(value):
+                    if isinstance(value, bytes):
+                        return value.decode("utf-8", errors="replace")
+                    return str(value or "")
+                found_title = _decode(info["object name"]).strip()
+                found_keywords = [_decode(v).strip().casefold() for v in (info["keywords"] or [])]
+                missing = []
+                if title and found_title != title:
+                    missing.append("Title")
+                if keywords and not all(k.casefold() in found_keywords for k in keywords):
+                    missing.append("Keywords")
+                if missing:
+                    return False, "ตรวจหลังฝังแล้วไม่พบ " + ", ".join(missing)
+                return True, ""
+        return False, f"ไม่รองรับการตรวจ Metadata สำหรับ format={actual_format or 'unknown'}"
+    except Exception as exc:
+        return False, f"ตรวจ Metadata หลังฝังไม่สำเร็จ: {type(exc).__name__}: {exc}"
+
+
 def embed_metadata(record: dict[str, Any]) -> tuple[bytes, str | None]:
     original_bytes = record["bytes"]
     title = str(record.get("title") or "").strip()
     keywords = parse_keywords(record.get("keywords"))
-    suffix = Path(record["filename"]).suffix.casefold()
+    actual_format = detect_actual_image_format(original_bytes, record)
 
     try:
-        if suffix == ".png":
-            return embed_png_metadata(original_bytes, title, keywords), None
-        if suffix in {".jpg", ".jpeg"}:
-            return embed_jpeg_iptc(original_bytes, suffix, title, keywords), None
-        return original_bytes, "ไม่รองรับการฝัง Metadata สำหรับนามสกุลนี้ จึงใช้ไฟล์ต้นฉบับ"
+        if actual_format == "PNG":
+            embedded = embed_png_metadata(original_bytes, title, keywords)
+        elif actual_format == "JPEG":
+            embedded = embed_jpeg_iptc(original_bytes, ".jpg", title, keywords)
+        else:
+            return original_bytes, f"ไม่รองรับการฝัง Metadata สำหรับไฟล์จริง format={actual_format or 'unknown'}"
+
+        ok, reason = verify_embedded_metadata(embedded, actual_format, title, keywords)
+        if not ok:
+            raise RuntimeError(reason)
+        return embedded, None
     except Exception as exc:
-        return original_bytes, f"ฝัง Metadata ไม่สำเร็จ จึงใช้ไฟล์ต้นฉบับ: {type(exc).__name__}: {exc}"
+        return original_bytes, f"ฝัง Metadata ไม่สำเร็จ: {type(exc).__name__}: {exc}"
 
 
 def adobe_csv_bytes(records: Iterable[dict[str, Any]]) -> bytes:
@@ -1110,7 +1195,12 @@ def build_export_zip(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     for record in records:
         export_record = dict(record)
-        export_record["export_filename"] = unique_filename(record["filename"], used_names)
+        corrected_name, format_warning = corrected_export_filename(
+            record["filename"], record["bytes"], record
+        )
+        export_record["export_filename"] = unique_filename(corrected_name, used_names)
+        if format_warning:
+            warnings.append(f"{record['filename']}: {format_warning}")
         export_records.append(export_record)
 
     adobe_csv = adobe_csv_bytes(export_records)
@@ -1120,9 +1210,11 @@ def build_export_zip(records: list[dict[str, Any]]) -> dict[str, Any]:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for record in export_records:
             embedded_bytes, warning = embed_metadata(record)
-            archive.writestr(f"images/{record['export_filename']}", embedded_bytes)
             if warning:
                 warnings.append(f"{record['export_filename']}: {warning}")
+                # Do not silently place the unmodified original into ZIP.
+                continue
+            archive.writestr(f"images/{record['export_filename']}", embedded_bytes)
         archive.writestr("adobe_stock_metadata.csv", adobe_csv)
         archive.writestr("quality_report.csv", quality_csv)
         archive.writestr("api_cost_report.csv", api_cost_csv)
@@ -1140,7 +1232,7 @@ def build_export_zip(records: list[dict[str, Any]]) -> dict[str, Any]:
         "quality_csv": quality_csv,
         "api_cost_csv": api_cost_csv,
         "warnings": warnings,
-        "exported_count": len(export_records),
+        "exported_count": sum(1 for r in export_records if not any(w.startswith(f"{r['export_filename']}:") and "ฝัง Metadata ไม่สำเร็จ" in w for w in warnings)),
     }
 
 # ========================================================================================
@@ -2853,7 +2945,7 @@ def render_asset(
 init_state()
 show_flash()
 
-st.title("🧠 AI Stock Vision V2.6 — Boot Safe")
+st.title("🧠 AI Stock Vision V2.7 — Metadata Safe")
 st.caption(
     "สร้าง Adobe Stock Title + 49 Keywords พร้อมตรวจคุณภาพ ติดตาม Token/ค่า API ต่อภาพ และ Export CSV/ZIP"
 )

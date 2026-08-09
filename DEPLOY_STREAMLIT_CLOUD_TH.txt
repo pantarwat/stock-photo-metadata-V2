@@ -1,0 +1,16 @@
+AI Stock Vision V2.5 — Streamlit Community Cloud
+
+1) อัปโหลด/commit ไฟล์ app.py และ requirements.txt นี้ทับของเดิมใน GitHub
+2) ลบโฟลเดอร์ __pycache__ ออกจาก GitHub (ไม่จำเป็นต่อการ deploy)
+3) ใน Streamlit Community Cloud กด Manage app > Reboot app
+4) ถ้ายังขึ้น Oh no ให้เปิด Manage app > Logs แล้วดูบรรทัด error สีแดงตัวแรก
+5) ถ้าต้องเปลี่ยน Python version: Streamlit ระบุว่าต้อง Delete app แล้ว Redeploy
+   จาก Advanced settings จึงจะเปลี่ยน Python ได้ แนะนำ Python 3.11 สำหรับ deployment นี้
+6) Secrets:
+   OPENAI_API_KEY = "sk-..."
+   ใส่ใน App settings > Secrets ไม่ต้อง commit ลง GitHub
+
+หมายเหตุ:
+- V2.5 ล็อก dependency แบบ exact version เพื่อลดปัญหา rebuild แล้วได้ library คนละเวอร์ชัน
+- app.py ยังคงเป็นไฟล์เดียว
+- Model discovery ยังคงดึงรายการจาก API Key และ fallback อัตโนมัติ

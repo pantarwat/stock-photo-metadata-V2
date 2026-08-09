@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-AI Stock Vision V2.4 — Single-file Streamlit application
+AI Stock Vision V2.5 — Cloud-safe single-file Streamlit application
 
 Run:
     pip install -r requirements.txt
@@ -18,8 +18,8 @@ Security:
 import tempfile
 from pathlib import Path
 
-APP_NAME = "AI Stock Vision V2.4 — Single File"
-PROMPT_VERSION = "v2.4.0-single-file"
+APP_NAME = "AI Stock Vision V2.5 — Cloud Safe"
+PROMPT_VERSION = "v2.5.0-cloud-safe"
 ANALYSIS_MAX_LONG_EDGE = 1800
 TOKEN_LADDER = (2400, 3600, 5000)
 TITLE_REPAIR_MAX_ATTEMPTS = 3
@@ -29,25 +29,26 @@ TITLE_REPAIR_MAX_ATTEMPTS = 3
 AUTO_MODEL_OPTION = "__auto_best_compatible__"
 DEFAULT_MODEL_ID = "gpt-5.6"
 LEGACY_VISION_FALLBACK_MODEL_ID = "gpt-4.1"
-USER_REQUESTED_MODEL_ID = "gpt-4.6"
 DEFAULT_AI_REVIEW_THRESHOLD = 75
 DEFAULT_USD_TO_THB = 35.0
 
 # Ordered from highest expected metadata quality to lower-cost / older fallbacks.
 # A candidate is only preferred automatically when the API key can see it.
 MODEL_QUALITY_PRIORITY = (
-    "gpt-5.6",
+    # Current official high-quality vision-capable families, ordered for this task.
+    "gpt-5.6",          # alias of GPT-5.6 Sol
     "gpt-5.6-sol",
+    "gpt-5.6-terra",
     "gpt-5.5",
     "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.4-nano",
-    # Compatibility only: attempted only when selected or returned by the API.
-    "gpt-4.6",
     "gpt-4.1",
-    "gpt-4.1-mini",
     "gpt-4o",
+    # Lower-cost fallbacks after the quality-oriented choices above.
+    "gpt-5.6-luna",
+    "gpt-5.4-mini",
+    "gpt-4.1-mini",
     "gpt-4o-mini",
+    "gpt-5.4-nano",
 )
 
 # Used only when model discovery cannot run. Each candidate is attempted safely;
@@ -55,11 +56,13 @@ MODEL_QUALITY_PRIORITY = (
 MODEL_DISCOVERY_FAILURE_CHAIN = (
     "gpt-5.6",
     "gpt-5.6-sol",
+    "gpt-5.6-terra",
     "gpt-5.5",
     "gpt-5.4",
-    "gpt-5.4-mini",
     "gpt-4.1",
     "gpt-4o",
+    "gpt-5.6-luna",
+    "gpt-5.4-mini",
     "gpt-4.1-mini",
     "gpt-4o-mini",
 )
@@ -559,6 +562,8 @@ MODEL_PRICING_USD_PER_MTOK: dict[str, dict[str, float]] = {
     # USD per 1M tokens. Verify periodically against official OpenAI pricing.
     "gpt-5.6": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
     "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "output": 12.00},
+    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "output": 1.20},
     "gpt-5.5": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
     "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
     "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
@@ -569,7 +574,7 @@ MODEL_PRICING_USD_PER_MTOK: dict[str, dict[str, float]] = {
     "gpt-4o": {"input": 2.50, "cached_input": 1.25, "output": 10.00},
     "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
 }
-PRICING_UPDATED_AT = "2026-07-11"
+PRICING_UPDATED_AT = "2026-08-09"
 
 
 def get_attr(obj: Any, name: str, default: Any = None) -> Any:
@@ -2162,6 +2167,8 @@ st.markdown(
 
 
 def init_state() -> None:
+    # Session state can survive reruns during a Cloud process lifetime. Keep defaults
+    # simple and repair obviously incompatible values after dependency upgrades.
     defaults: dict[str, Any] = {
         "assets": {},
         "asset_order": [],
@@ -2176,6 +2183,14 @@ def init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    # Defensive repair for stale/corrupted state after Cloud rebuilds.
+    if not isinstance(st.session_state.get("assets"), dict):
+        st.session_state.assets = {}
+    if not isinstance(st.session_state.get("asset_order"), list):
+        st.session_state.asset_order = []
+    if not isinstance(st.session_state.get("available_models"), list):
+        st.session_state.available_models = []
 
 
 def set_flash(level: str, message: str) -> None:
@@ -2821,9 +2836,16 @@ def render_asset(
 init_state()
 show_flash()
 
-st.title("🧠 AI Stock Vision V2.4 — Single File")
+st.title("🧠 AI Stock Vision V2.5 — Cloud Safe")
 st.caption(
     "สร้าง Adobe Stock Title + 49 Keywords พร้อมตรวจคุณภาพ ติดตาม Token/ค่า API ต่อภาพ และ Export CSV/ZIP"
+)
+
+# Cloud diagnostics: useful when Streamlit Community Cloud rebuilds with a new runtime.
+import platform
+st.caption(
+    f"Runtime: Python {platform.python_version()} · Streamlit {st.__version__} · "
+    f"App {APP_NAME}"
 )
 
 with st.sidebar:
@@ -2847,13 +2869,6 @@ with st.sidebar:
                 st.session_state.available_models = models
                 st.session_state.selected_model_id = AUTO_MODEL_OPTION
                 st.success(f"พบโมเดลที่มีแนวโน้มรองรับงานนี้ {len(models)} โมเดล")
-                if USER_REQUESTED_MODEL_ID in models:
-                    st.info(f"บัญชีนี้มองเห็น {USER_REQUESTED_MODEL_ID} และสามารถเลือกใช้ได้")
-                else:
-                    st.warning(
-                        f"ไม่พบ {USER_REQUESTED_MODEL_ID} ในรายการของ API Key นี้ "
-                        "ระบบจะไม่ฝืนเรียกชื่อโมเดลที่ไม่มีจริง และจะเลือกตัวที่ดีที่สุดแทน"
-                    )
             except Exception as exc:
                 error = classify_api_error(exc, api_key)
                 st.error(f"{error['friendly']}\n\n{error['detail']}")
@@ -2877,7 +2892,7 @@ with st.sidebar:
     st.session_state.selected_model_id = selected_model
     custom_model = st.text_input(
         "Custom Model ID",
-        placeholder="เช่น gpt-4.1 หรือ gpt-4.6 — ระบบจะลองแล้ว fallback ให้อัตโนมัติ",
+        placeholder="เช่น gpt-5.6-terra หรือ gpt-4.1 — ระบบจะลองแล้ว fallback ให้อัตโนมัติ",
     )
     auto_model_fallback = st.checkbox(
         "สลับไปโมเดลสำรองอัตโนมัติ",
@@ -2898,10 +2913,6 @@ with st.sidebar:
             suffix = " → …" if len(effective_models) > 6 else ""
             st.caption(f"Fallback chain: {preview}{suffix}")
 
-    if custom_model.strip() == USER_REQUESTED_MODEL_ID and models and USER_REQUESTED_MODEL_ID not in models:
-        st.warning(
-            f"API Key นี้ไม่พบ {USER_REQUESTED_MODEL_ID}; ระบบจะลองตามคำขอหนึ่งครั้งแล้วสลับไปตัวที่ใช้งานได้"
-        )
     if not models:
         st.warning(
             f"ยังไม่ได้ดึงรายการโมเดล ระบบจะลอง {DEFAULT_MODEL_ID} ก่อน "

@@ -1,5 +1,6 @@
-streamlit>=1.40,<2
-openai>=1.68,<3
-pydantic>=2.8,<3
-Pillow>=10.4,<13
-IPTCInfo3>=2.3,<3
+# Exact pins make Streamlit Community Cloud rebuilds reproducible.
+streamlit==1.61.1
+openai==2.53.0
+pydantic==2.13.4
+Pillow==12.3.0
+IPTCInfo3==2.3.0

@@ -1,0 +1,8 @@
+# Conservative, reproducible pins for Streamlit Community Cloud.
+# Streamlit 1.59.2 is used intentionally instead of the newest 1.61.x release
+# to reduce the chance of a just-released Cloud/runtime regression.
+streamlit==1.59.2
+openai==2.53.0
+pydantic==2.13.4
+Pillow==12.3.0
+IPTCInfo3==2.3.0

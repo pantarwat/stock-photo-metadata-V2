@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-AI Stock Vision V2.7 — Metadata-safe single-file Streamlit application
+AI Stock Vision V2.9 — Session-safe single-file Streamlit application
 
 Run:
     pip install -r requirements.txt
@@ -23,8 +23,8 @@ import traceback
 # inside the app instead of only displaying Community Cloud's generic "Oh no" page.
 import streamlit as st
 
-APP_NAME = "AI Stock Vision V2.7 — Metadata Safe"
-PROMPT_VERSION = "v2.7.0-metadata-safe"
+APP_NAME = "AI Stock Vision V2.9 — Session Safe"
+PROMPT_VERSION = "v2.9.0-session-safe"
 ANALYSIS_MAX_LONG_EDGE = 1800
 TOKEN_LADDER = (2400, 3600, 5000)
 TITLE_REPAIR_MAX_ATTEMPTS = 3
@@ -77,12 +77,16 @@ ANALYSIS_CACHE_DIR = APP_CACHE_DIR / "analysis"
 TITLE_CACHE_DIR = APP_CACHE_DIR / "title"
 QUALITY_CACHE_DIR = APP_CACHE_DIR / "quality"
 EXPORT_CACHE_DIR = APP_CACHE_DIR / "exports"
+UPLOAD_CACHE_DIR = APP_CACHE_DIR / "uploads"
+PREVIEW_CACHE_DIR = APP_CACHE_DIR / "previews"
 
 CACHE_DIRS = (
     ANALYSIS_CACHE_DIR,
     TITLE_CACHE_DIR,
     QUALITY_CACHE_DIR,
     EXPORT_CACHE_DIR,
+    UPLOAD_CACHE_DIR,
+    PREVIEW_CACHE_DIR,
 )
 
 DEFAULT_BLACKLIST = {
@@ -223,6 +227,67 @@ def human_bytes(size: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024
     return f"{size} B"
+
+
+def persist_original_blob(asset_id: str, data: bytes) -> str:
+    """Persist original upload outside widget/session memory for rerun safety."""
+    ensure_cache_dirs()
+    path = UPLOAD_CACHE_DIR / f"{asset_id}.bin"
+    if data and (not path.exists() or path.stat().st_size != len(data)):
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_bytes(data)
+        temp_path.replace(path)
+    return str(path)
+
+
+def get_record_bytes(record: dict[str, Any]) -> bytes:
+    """Return original image bytes from session or disk-backed upload cache."""
+    data = record.get("bytes")
+    if isinstance(data, (bytes, bytearray, memoryview)) and len(data) > 0:
+        return bytes(data)
+    blob_path = str(record.get("blob_path") or "").strip()
+    if blob_path:
+        path = Path(blob_path)
+        if path.exists() and path.is_file():
+            data = path.read_bytes()
+            if data:
+                return data
+    raise FileNotFoundError(
+        "ไม่พบข้อมูลภาพต้นฉบับใน Session/Cache กรุณาอัปโหลดภาพนี้ใหม่"
+    )
+
+
+def get_preview_bytes(record: dict[str, Any], max_long_edge: int = 1200) -> bytes:
+    """Create/use a lightweight preview so large originals don't disappear on reruns."""
+    ensure_cache_dirs()
+    digest = str(record.get("sha256") or record.get("id") or "preview")
+    preview_path = PREVIEW_CACHE_DIR / f"{digest[:40]}_{max_long_edge}.preview"
+    if preview_path.exists():
+        try:
+            cached = preview_path.read_bytes()
+            if cached:
+                return cached
+        except OSError:
+            pass
+
+    original = get_record_bytes(record)
+    with Image.open(io.BytesIO(original)) as source:
+        source.load()
+        source = ImageOps.exif_transpose(source)
+        alpha = has_transparency(source)
+        working = source.convert("RGBA" if alpha else "RGB")
+        working.thumbnail((max_long_edge, max_long_edge), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        if alpha:
+            working.save(output, format="PNG", optimize=True)
+        else:
+            working.save(output, format="JPEG", quality=86, optimize=True, progressive=True)
+        data = output.getvalue()
+    try:
+        preview_path.write_bytes(data)
+    except OSError:
+        pass
+    return data
 
 # ========================================================================================
 # Inlined from: core/image_utils.py
@@ -1040,7 +1105,7 @@ def verify_embedded_metadata(image_bytes: bytes, actual_format: str, title: str,
 
 
 def embed_metadata(record: dict[str, Any]) -> tuple[bytes, str | None]:
-    original_bytes = record["bytes"]
+    original_bytes = get_record_bytes(record)
     title = str(record.get("title") or "").strip()
     keywords = parse_keywords(record.get("keywords"))
     actual_format = detect_actual_image_format(original_bytes, record)
@@ -1196,7 +1261,7 @@ def build_export_zip(records: list[dict[str, Any]]) -> dict[str, Any]:
     for record in records:
         export_record = dict(record)
         corrected_name, format_warning = corrected_export_filename(
-            record["filename"], record["bytes"], record
+            record["filename"], get_record_bytes(record), record
         )
         export_record["export_filename"] = unique_filename(corrected_name, used_names)
         if format_warning:
@@ -1226,7 +1291,7 @@ def build_export_zip(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "zip_path": str(zip_path),
-        "zip_bytes": zip_path.read_bytes(),
+        "zip_size_bytes": zip_path.stat().st_size,
         "filename": zip_path.name,
         "adobe_csv": adobe_csv,
         "quality_csv": quality_csv,
@@ -2341,20 +2406,46 @@ def parse_blacklist(text: str) -> list[str]:
 
 
 def sync_uploaded_files(uploaded_files: list[Any]) -> None:
-    active_assets: dict[str, dict[str, Any]] = {}
-    active_order: list[str] = []
-    existing = st.session_state.assets
+    """Merge uploader values into durable session state instead of replacing it.
+
+    Streamlit reruns after analysis and widget interactions. On Community Cloud the
+    uploader can transiently report an empty list during a rerun/reconnect. V2.7
+    treated that as "delete every asset", which also cleared the export bundle.
+    V2.9 keeps current assets unless the user explicitly presses the clear button.
+    """
+    existing: dict[str, dict[str, Any]] = st.session_state.assets
+
+    # Critical rerun guard: an empty uploader value must NOT erase analysed assets.
+    if not uploaded_files:
+        return
+
+    active_assets: dict[str, dict[str, Any]] = dict(existing)
+    active_order: list[str] = list(st.session_state.asset_order)
+    saw_new_asset = False
 
     for uploaded in uploaded_files:
         data = uploaded.getvalue()
+        if not data:
+            # Ignore a transient zero-byte widget value rather than corrupting state.
+            continue
         digest = sha256_bytes(data)
         name_digest = sha256_bytes(uploaded.name.encode("utf-8"))[:8]
         asset_id = f"{digest[:20]}_{name_digest}_{Path(uploaded.name).suffix.casefold()}"
-        active_order.append(asset_id)
+        blob_path = persist_original_blob(asset_id, data)
+
+        if asset_id not in active_order:
+            active_order.append(asset_id)
+            saw_new_asset = True
 
         if asset_id in existing:
             record = existing[asset_id]
             record["filename"] = uploaded.name
+            record["blob_path"] = blob_path
+            record["sha256"] = digest
+            record["size_bytes"] = len(data)
+            record["mime_type"] = uploaded.type or record.get("mime_type") or "application/octet-stream"
+            # Keep originals disk-backed to reduce session memory and WebSocket pressure.
+            record["bytes"] = b""
             active_assets[asset_id] = record
             continue
 
@@ -2376,7 +2467,8 @@ def sync_uploaded_files(uploaded_files: list[Any]) -> None:
         active_assets[asset_id] = {
             "id": asset_id,
             "filename": uploaded.name,
-            "bytes": data,
+            "bytes": b"",
+            "blob_path": blob_path,
             "sha256": digest,
             "size_bytes": len(data),
             "mime_type": uploaded.type or "application/octet-stream",
@@ -2401,7 +2493,7 @@ def sync_uploaded_files(uploaded_files: list[Any]) -> None:
             "ui_revision": 0,
         }
 
-    if active_order != st.session_state.asset_order:
+    if saw_new_asset:
         st.session_state.export_bundle = None
     st.session_state.assets = active_assets
     st.session_state.asset_order = active_order
@@ -2604,7 +2696,7 @@ def analyze_worker(
     auto_review: bool,
 ) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
     analysis_result = analyze_image(
-        original_bytes=record["bytes"],
+        original_bytes=get_record_bytes(record),
         image_sha256=record["sha256"],
         api_key=api_key,
         model=model,
@@ -2617,7 +2709,7 @@ def analyze_worker(
     if auto_review and analysis_result.get("ok"):
         data = analysis_result.get("data") or {}
         review_result = review_metadata(
-            original_bytes=record["bytes"],
+            original_bytes=get_record_bytes(record),
             image_sha256=record["sha256"],
             api_key=api_key,
             model=model,
@@ -2738,7 +2830,12 @@ def render_asset(
         preview_col, form_col = st.columns([0.9, 1.8], gap="large")
 
         with preview_col:
-            st.image(record["bytes"], use_container_width=True)
+            try:
+                preview_bytes = get_preview_bytes(record)
+                st.image(preview_bytes, use_container_width=True)
+            except Exception as exc:
+                st.error(f"แสดง Preview ไม่สำเร็จ: {type(exc).__name__}: {exc}")
+                st.caption("ไฟล์ต้นฉบับยังคงถูกเก็บไว้สำหรับวิเคราะห์/Export หาก Cache ยังอยู่")
             st.markdown(
                 f"""
 <div class="small-muted">
@@ -2850,7 +2947,7 @@ def render_asset(
                 else:
                     with st.spinner("กำลังวิเคราะห์ภาพและสร้าง Metadata..."):
                         result = analyze_image(
-                            original_bytes=record["bytes"],
+                            original_bytes=get_record_bytes(record),
                             image_sha256=record["sha256"],
                             api_key=api_key,
                             model=model,
@@ -2908,7 +3005,7 @@ def render_asset(
                 else:
                     with st.spinner("กำลังตรวจความตรงของ Metadata กับภาพ..."):
                         result = review_metadata(
-                            original_bytes=record["bytes"],
+                            original_bytes=get_record_bytes(record),
                             image_sha256=record["sha256"],
                             api_key=api_key,
                             model=model,
@@ -2945,9 +3042,9 @@ def render_asset(
 init_state()
 show_flash()
 
-st.title("🧠 AI Stock Vision V2.7 — Metadata Safe")
+st.title("🧠 AI Stock Vision V2.9 — Session Safe")
 st.caption(
-    "สร้าง Adobe Stock Title + 49 Keywords พร้อมตรวจคุณภาพ ติดตาม Token/ค่า API ต่อภาพ และ Export CSV/ZIP"
+    "สร้าง Adobe Stock Title + 49 Keywords พร้อม Preview/Session ที่ทนต่อ rerun และ Export CSV/ZIP แบบดาวน์โหลดเสถียร"
 )
 
 # Cloud diagnostics: useful when Streamlit Community Cloud rebuilds with a new runtime.
@@ -3196,7 +3293,7 @@ with export_col:
             try:
                 with st.spinner("กำลังฝัง Metadata และสร้างไฟล์ ZIP..."):
                     st.session_state.export_bundle = build_export_zip(selected_records)
-                st.success(f"เตรียม Export แล้ว {len(selected_records)} ภาพ")
+                st.success(f"เตรียม Export แล้ว {st.session_state.export_bundle.get('exported_count', 0)}/{len(selected_records)} ภาพ")
             except Exception as exc:
                 st.error(f"สร้างไฟล์ Export ไม่สำเร็จ: {type(exc).__name__}: {exc}")
 
@@ -3211,6 +3308,8 @@ if bundle:
         data=bundle["adobe_csv"],
         file_name="adobe_stock_metadata.csv",
         mime="text/csv",
+        key="download_adobe_csv",
+        on_click="ignore",
         use_container_width=True,
     )
     download_cols[1].download_button(
@@ -3218,6 +3317,8 @@ if bundle:
         data=bundle["quality_csv"],
         file_name="quality_report.csv",
         mime="text/csv",
+        key="download_quality_csv",
+        on_click="ignore",
         use_container_width=True,
     )
     download_cols[2].download_button(
@@ -3225,14 +3326,23 @@ if bundle:
         data=bundle["api_cost_csv"],
         file_name="api_cost_report.csv",
         mime="text/csv",
+        key="download_api_cost_csv",
+        on_click="ignore",
         use_container_width=True,
     )
+    zip_path_for_download = str(bundle["zip_path"])
     download_cols[3].download_button(
         "ดาวน์โหลด ZIP พร้อมภาพ",
-        data=bundle["zip_bytes"],
+        data=lambda p=zip_path_for_download: Path(p).read_bytes(),
         file_name=bundle["filename"],
         mime="application/zip",
+        key="download_export_zip",
+        on_click="ignore",
         use_container_width=True,
+    )
+    st.caption(
+        f"ZIP พร้อมดาวน์โหลด: {human_bytes(int(bundle.get('zip_size_bytes', 0)))} · "
+        "ปุ่มดาวน์โหลดไม่ทำให้แอป rerun"
     )
     if bundle.get("warnings"):
         with st.expander("Export warnings"):

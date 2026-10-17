@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-AI Stock Vision V2.9 — Session-safe single-file Streamlit application
+AI Stock Vision V2.10 — Media-safe single-file Streamlit application
 
 Run:
     pip install -r requirements.txt
@@ -23,8 +23,8 @@ import traceback
 # inside the app instead of only displaying Community Cloud's generic "Oh no" page.
 import streamlit as st
 
-APP_NAME = "AI Stock Vision V2.9 — Session Safe"
-PROMPT_VERSION = "v2.9.0-session-safe"
+APP_NAME = "AI Stock Vision V2.10 — Media Safe"
+PROMPT_VERSION = "v2.10.0-media-safe"
 ANALYSIS_MAX_LONG_EDGE = 1800
 TOKEN_LADDER = (2400, 3600, 5000)
 TITLE_REPAIR_MAX_ATTEMPTS = 3
@@ -288,6 +288,34 @@ def get_preview_bytes(record: dict[str, Any], max_long_edge: int = 1200) -> byte
     except OSError:
         pass
     return data
+
+
+def render_preview_inline(record: dict[str, Any], max_long_edge: int = 960) -> None:
+    """Render a lightweight preview inline, bypassing Streamlit's /media endpoint."""
+    import base64 as _base64
+
+    try:
+        preview = get_preview_bytes(record, max_long_edge=max_long_edge)
+        if preview.startswith(b"\x89PNG\r\n\x1a\n"):
+            mime = "image/png"
+        elif preview.startswith(b"\xff\xd8\xff"):
+            mime = "image/jpeg"
+        else:
+            with Image.open(io.BytesIO(preview)) as _img:
+                fmt = str(_img.format or "").upper()
+            mime = "image/png" if fmt == "PNG" else "image/jpeg"
+        encoded = _base64.b64encode(preview).decode("ascii")
+        html = (
+            '<div style="width:100%;display:flex;justify-content:center;align-items:center;'
+            'min-height:120px;background:rgba(17,24,39,.03);border-radius:10px;overflow:hidden;">'
+            f'<img src="data:{mime};base64,{encoded}" '
+            'style="display:block;width:100%;height:auto;max-height:560px;object-fit:contain;" '
+            'alt="Image preview"></div>'
+        )
+        st.markdown(html, unsafe_allow_html=True)
+    except Exception as exc:
+        st.error(f"แสดง Preview ไม่สำเร็จ: {type(exc).__name__}: {exc}")
+        st.caption("ไฟล์ต้นฉบับยังคงอยู่สำหรับวิเคราะห์และ Export")
 
 # ========================================================================================
 # Inlined from: core/image_utils.py
@@ -1251,9 +1279,9 @@ def api_cost_csv_bytes(records: Iterable[dict[str, Any]]) -> bytes:
 
 
 def build_export_zip(records: list[dict[str, Any]]) -> dict[str, Any]:
-    EXPORT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    """Build the export ZIP fully in memory to avoid /tmp and /media races."""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    zip_path = EXPORT_CACHE_DIR / f"ai_stock_vision_export_{timestamp}.zip"
+    filename = f"ai_stock_vision_export_{timestamp}.zip"
     used_names: set[str] = set()
     export_records: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -1272,32 +1300,38 @@ def build_export_zip(records: list[dict[str, Any]]) -> dict[str, Any]:
     quality_csv = quality_csv_bytes(export_records)
     api_cost_csv = api_cost_csv_bytes(export_records)
 
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+    zip_buffer = io.BytesIO()
+    exported_count = 0
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for record in export_records:
             embedded_bytes, warning = embed_metadata(record)
             if warning:
                 warnings.append(f"{record['export_filename']}: {warning}")
-                # Do not silently place the unmodified original into ZIP.
                 continue
             archive.writestr(f"images/{record['export_filename']}", embedded_bytes)
+            exported_count += 1
         archive.writestr("adobe_stock_metadata.csv", adobe_csv)
         archive.writestr("quality_report.csv", quality_csv)
         archive.writestr("api_cost_report.csv", api_cost_csv)
         if warnings:
-            archive.writestr(
-                "export_warnings.txt",
-                "\n".join(warnings).encode("utf-8"),
-            )
+            archive.writestr("export_warnings.txt", "\n".join(warnings).encode("utf-8"))
+
+    zip_bytes = zip_buffer.getvalue()
+    if len(zip_bytes) > 180 * 1024 * 1024:
+        warnings.append(
+            "ZIP มีขนาดเกิน 180 MB ซึ่งอาจดาวน์โหลดไม่เสถียรบน Community Cloud; "
+            "แนะนำแบ่ง Export เป็นหลายชุด"
+        )
 
     return {
-        "zip_path": str(zip_path),
-        "zip_size_bytes": zip_path.stat().st_size,
-        "filename": zip_path.name,
+        "zip_bytes": zip_bytes,
+        "zip_size_bytes": len(zip_bytes),
+        "filename": filename,
         "adobe_csv": adobe_csv,
         "quality_csv": quality_csv,
         "api_cost_csv": api_cost_csv,
         "warnings": warnings,
-        "exported_count": sum(1 for r in export_records if not any(w.startswith(f"{r['export_filename']}:") and "ฝัง Metadata ไม่สำเร็จ" in w for w in warnings)),
+        "exported_count": exported_count,
     }
 
 # ========================================================================================
@@ -2411,7 +2445,7 @@ def sync_uploaded_files(uploaded_files: list[Any]) -> None:
     Streamlit reruns after analysis and widget interactions. On Community Cloud the
     uploader can transiently report an empty list during a rerun/reconnect. V2.7
     treated that as "delete every asset", which also cleared the export bundle.
-    V2.9 keeps current assets unless the user explicitly presses the clear button.
+    V2.10 keeps current assets unless the user explicitly presses the clear button.
     """
     existing: dict[str, dict[str, Any]] = st.session_state.assets
 
@@ -2830,12 +2864,7 @@ def render_asset(
         preview_col, form_col = st.columns([0.9, 1.8], gap="large")
 
         with preview_col:
-            try:
-                preview_bytes = get_preview_bytes(record)
-                st.image(preview_bytes, use_container_width=True)
-            except Exception as exc:
-                st.error(f"แสดง Preview ไม่สำเร็จ: {type(exc).__name__}: {exc}")
-                st.caption("ไฟล์ต้นฉบับยังคงถูกเก็บไว้สำหรับวิเคราะห์/Export หาก Cache ยังอยู่")
+            render_preview_inline(record)
             st.markdown(
                 f"""
 <div class="small-muted">
@@ -3042,7 +3071,7 @@ def render_asset(
 init_state()
 show_flash()
 
-st.title("🧠 AI Stock Vision V2.9 — Session Safe")
+st.title("🧠 AI Stock Vision V2.10 — Media Safe")
 st.caption(
     "สร้าง Adobe Stock Title + 49 Keywords พร้อม Preview/Session ที่ทนต่อ rerun และ Export CSV/ZIP แบบดาวน์โหลดเสถียร"
 )
@@ -3330,10 +3359,9 @@ if bundle:
         on_click="ignore",
         use_container_width=True,
     )
-    zip_path_for_download = str(bundle["zip_path"])
     download_cols[3].download_button(
         "ดาวน์โหลด ZIP พร้อมภาพ",
-        data=lambda p=zip_path_for_download: Path(p).read_bytes(),
+        data=bundle["zip_bytes"],
         file_name=bundle["filename"],
         mime="application/zip",
         key="download_export_zip",
@@ -3342,7 +3370,7 @@ if bundle:
     )
     st.caption(
         f"ZIP พร้อมดาวน์โหลด: {human_bytes(int(bundle.get('zip_size_bytes', 0)))} · "
-        "ปุ่มดาวน์โหลดไม่ทำให้แอป rerun"
+        "ZIP ถูกเก็บใน Session memory เพื่อลดปัญหา temp-file /media 404"
     )
     if bundle.get("warnings"):
         with st.expander("Export warnings"):
